@@ -69,6 +69,94 @@ async def test_gemini_prepare_conversation_removes_leading_model_content():
 
 
 @pytest.mark.asyncio
+async def test_gemini_prepare_conversation_splits_user_text_after_function_response():
+    """A user message following tool results must stay in its own Content.
+
+    Vertex AI rejects a trailing Content mixing functionResponse with text
+    parts ("Requests ending with a model turn are not supported.").
+    """
+    provider = ProviderGoogleGenAI.__new__(ProviderGoogleGenAI)
+
+    contents = await provider._prepare_conversation(
+        {
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Paris"}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "25C sunny"},
+                {"role": "user", "content": "Stop using tools and reply directly."},
+            ]
+        }
+    )
+
+    assert [type(content) for content in contents] == [
+        types.UserContent,
+        types.ModelContent,
+        types.UserContent,
+        types.UserContent,
+    ]
+    trailing = contents[-1]
+    assert trailing.parts is not None
+    assert len(trailing.parts) == 1
+    assert trailing.parts[0].text == "Stop using tools and reply directly."
+    tool_turn = contents[2]
+    assert tool_turn.parts is not None
+    assert tool_turn.parts[0].function_response is not None
+
+
+@pytest.mark.asyncio
+async def test_gemini_prepare_conversation_merges_adjacent_tool_responses():
+    provider = ProviderGoogleGenAI.__new__(ProviderGoogleGenAI)
+
+    contents = await provider._prepare_conversation(
+        {
+            "messages": [
+                {"role": "user", "content": "compare"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "get_weather", "arguments": "{}"},
+                        },
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {"name": "get_time", "arguments": "{}"},
+                        },
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "25C"},
+                {"role": "tool", "tool_call_id": "call_2", "content": "10:00"},
+            ]
+        }
+    )
+
+    assert [type(content) for content in contents] == [
+        types.UserContent,
+        types.ModelContent,
+        types.UserContent,
+    ]
+    # Adjacent functionResponses (parallel tool calls) still merge.
+    assert contents[2].parts is not None
+    assert len(contents[2].parts) == 2
+
+
+@pytest.mark.asyncio
 async def test_gemini_prepare_conversation_keeps_normal_user_first_history():
     provider = ProviderGoogleGenAI.__new__(ProviderGoogleGenAI)
 

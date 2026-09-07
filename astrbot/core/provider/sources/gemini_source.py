@@ -330,10 +330,27 @@ class ProviderGoogleGenAI(Provider):
             part: list[types.Part],
             content_cls: type[types.Content],
         ) -> None:
-            if contents and isinstance(contents[-1], content_cls):
+            # Only merge same-kind parts. Upstreams such as Vertex AI reject a
+            # Content mixing functionResponse with text/image parts with the
+            # misleading error "Requests ending with a model turn are not
+            # supported.", so runner-injected user messages that follow tool
+            # results must start a new Content instead of being merged.
+            part_has_function_response = any(
+                p.function_response is not None for p in part
+            )
+            if (
+                contents
+                and isinstance(contents[-1], content_cls)
+                and any(
+                    p.function_response is not None for p in (contents[-1].parts or [])
+                )
+                == part_has_function_response
+            ):
                 assert contents[-1].parts is not None
                 contents[-1].parts.extend(part)
-            else:
+            elif part:
+                # Skip empty part lists: a Content without parts is invalid
+                # for the Gemini API.
                 contents.append(content_cls(parts=part))
 
         gemini_contents: list[types.Content] = []

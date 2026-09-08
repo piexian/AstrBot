@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import copy
 import enum
 import json
 from dataclasses import dataclass, field
@@ -15,10 +17,16 @@ import astrbot.core.message.components as Comp
 from astrbot import logger
 from astrbot.core.agent.message import (
     AssistantMessageSegment,
+    AudioURLPart,
     ContentPart,
+    ImageURLPart,
+    TextPart,
+    ThinkPart,
     ToolCall,
     ToolCallMessageSegment,
     is_checkpoint_message,
+    message_view_digest,
+    protocol_content_digest,
 )
 from astrbot.core.agent.tool import ToolSet
 from astrbot.core.db.po import Conversation
@@ -305,16 +313,19 @@ class LLMResponse:
     """Tool call names."""
     tools_call_ids: list[str] = field(default_factory=list)
     """Tool call IDs."""
-    tools_call_extra_content: dict[str, dict[str, Any]] = field(default_factory=dict)
+    tools_call_extra_content: dict[str, dict[str, Any]] = field(
+        default_factory=dict, repr=False
+    )
     """Tool call extra content. tool_call_id -> extra_content dict"""
     reasoning_content: str | None = None
     """The reasoning content extracted from the LLM, if any."""
-    reasoning_signature: str | None = None
+    reasoning_signature: str | None = field(default=None, repr=False)
     """The signature of the reasoning content, if any."""
+    provider_state: dict[str, Any] | None = field(default=None, repr=False)
 
     raw_completion: (
         ChatCompletion | Response | GenerateContentResponse | AnthropicMessage | None
-    ) = None
+    ) = field(default=None, repr=False)
     """The raw completion response from the LLM provider."""
 
     _completion_text: str = ""
@@ -347,6 +358,7 @@ class LLMResponse:
         is_chunk: bool = False,
         id: str | None = None,
         usage: TokenUsage | None = None,
+        provider_state: dict[str, Any] | None = None,
     ) -> None:
         """初始化 LLMResponse
 
@@ -379,6 +391,7 @@ class LLMResponse:
         self.reasoning_signature = reasoning_signature
         self.raw_completion = raw_completion
         self.is_chunk = is_chunk
+        self.provider_state = provider_state
 
         if id is not None:
             self.id = id
@@ -441,6 +454,72 @@ class LLMResponse:
                 ),
             )
         return ret
+
+    def to_assistant_message(
+        self, *, bind_native_state: bool = False
+    ) -> AssistantMessageSegment:
+        """Build the display message and bind optional native protocol state.
+
+        Args:
+            bind_native_state: Establish the view only at original parsing or
+                the explicit skills-like display/protocol merge boundary.
+
+        Returns:
+            A persistable message whose native snapshot is valid only for this
+            exact logical content and set of tool calls.
+        """
+        parts = []
+        if self.reasoning_content is not None or self.reasoning_signature:
+            parts.append(
+                ThinkPart(
+                    think=self.reasoning_content or "",
+                    encrypted=self.reasoning_signature,
+                )
+            )
+        if self.completion_text:
+            parts.append(TextPart(text=self.completion_text))
+        state = copy.deepcopy(self.provider_state)
+        media_urls = {}
+        if state and "gemini" in state:
+            # Match display media against the original encoded bytes. Never add
+            # media removed from the response chain by a hook or redaction.
+            for part in state["gemini"].get("content", {}).get("parts", []):
+                blob = part.get("inlineData")
+                if blob and blob.get("data"):
+                    encoded = base64.b64encode(
+                        base64.urlsafe_b64decode(blob["data"])
+                    ).decode("ascii")
+                    url = f"data:{blob['mimeType']};base64,{encoded}"
+                    media_urls[f"base64://{encoded}"] = url
+        for component in self.result_chain.chain if self.result_chain else []:
+            if isinstance(component, (Comp.Image, Comp.Record)):
+                ref = component.url or component.file
+                if ref:
+                    url = media_urls.get(ref, ref)
+                    if isinstance(component, Comp.Image):
+                        parts.append(
+                            ImageURLPart(image_url=ImageURLPart.ImageURL(url=url))
+                        )
+                    else:
+                        parts.append(
+                            AudioURLPart(audio_url=AudioURLPart.AudioURL(url=url))
+                        )
+        message = AssistantMessageSegment(
+            content=parts or ([] if not self.tools_call_name else None),
+            tool_calls=self.to_openai_tool_calls_model()
+            if self.tools_call_name
+            else None,
+        )
+        if state and "gemini" in state:
+            digest = message_view_digest(message.model_dump())
+            if bind_native_state:
+                state["gemini"]["view_digest"] = digest
+            elif state["gemini"].get("view_digest") != digest or state["gemini"].get(
+                "content_digest"
+            ) != protocol_content_digest(state["gemini"].get("content")):
+                state = {"gemini": {"version": 1, "invalidated": True}}
+        message.provider_state = state
+        return message
 
     @deprecated(reason="Use to_openai_tool_calls_model instead.")
     def to_openai_to_calls_model(self) -> list[ToolCall]:

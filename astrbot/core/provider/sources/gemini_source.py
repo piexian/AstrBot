@@ -5,6 +5,7 @@ import logging
 import random
 from collections.abc import AsyncGenerator
 from typing import Literal, cast
+from uuid import uuid4
 
 import httpx
 from google import genai
@@ -14,7 +15,14 @@ from google.genai.errors import APIError
 import astrbot.core.message.components as Comp
 from astrbot import logger
 from astrbot.api.provider import Provider
-from astrbot.core.agent.message import AudioURLPart, ContentPart, ImageURLPart, TextPart
+from astrbot.core.agent.message import (
+    AudioURLPart,
+    ContentPart,
+    ImageURLPart,
+    TextPart,
+    message_view_digest,
+    protocol_content_digest,
+)
 from astrbot.core.exceptions import EmptyModelOutputError
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.provider.entities import LLMResponse, TokenUsage
@@ -44,6 +52,7 @@ logging.getLogger("google_genai.types").addFilter(SuppressNonTextPartsWarning())
     "Google Gemini Chat Completion 提供商适配器",
 )
 class ProviderGoogleGenAI(Provider):
+    preserve_native_message_state = True
     CATEGORY_MAPPING = {
         "harassment": types.HarmCategory.HARM_CATEGORY_HARASSMENT,
         "hate_speech": types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -138,16 +147,12 @@ class ProviderGoogleGenAI(Provider):
             if len(keys) > 0:
                 self.set_key(random.choice(keys))
                 logger.warning(
-                    "Retrying with a different API key due to detected key issue: %s. Current key: %s...",
-                    e.message,
-                    self.chosen_api_key[:12],
+                    "Retrying Gemini request with another API key (status %s).",
+                    e.code,
                 )
                 await asyncio.sleep(1)
                 return True
-            logger.error(
-                "No valid API keys remaining. Current key: %s...",
-                self.chosen_api_key[:12],
-            )
+            logger.error("No valid Gemini API keys remaining.")
             raise Exception("Gemini API rate limit reached or API key issue detected.")
 
         # 连接错误处理
@@ -295,170 +300,242 @@ class ProviderGoogleGenAI(Provider):
         )
 
     async def _prepare_conversation(self, payloads: dict) -> list[types.Content]:
-        """准备 Gemini SDK 的 Content 列表"""
+        """Convert history without changing signed Parts or tool batch boundaries.
 
-        def create_text_part(text: str) -> types.Part:
-            content_a = text if text else " "
-            if not text:
-                logger.warning("Text content is empty, added a space as placeholder.")
-            return types.Part.from_text(text=content_a)
+        Args:
+            payloads: Logical messages and the target model.
 
-        async def process_image_url(image_url_dict: dict) -> types.Part:
-            url = image_url_dict["url"]
-            image_data = await resolve_media_ref_to_base64_data(
-                url,
-                media_type="image",
-                strict=True,
-            )
-            if image_data is None:
+        Returns:
+            Explicit SDK Content objects in protocol order.
+
+        Raises:
+            ValueError: Native state is stale or a tool batch cannot be paired.
+        """
+        contents: list[types.Content] = []
+        pending: list[tuple[str, types.FunctionCall]] = []
+        results: dict[int, types.Part] = {}
+        model = payloads.get("model", getattr(self, "model_name", ""))
+        last_user_index = max(
+            (
+                index
+                for index, message in enumerate(payloads["messages"])
+                if message.get("role") == "user"
+            ),
+            default=-1,
+        )
+        for message_index, message in enumerate(payloads["messages"]):
+            role = message["role"]
+            if role == "system":
+                continue
+            if pending and role != "tool":
                 raise ValueError(
-                    f"Failed to resolve Gemini history image: {describe_media_ref(url)}"
+                    f"Message {message_index}: tool batch is missing results."
                 )
-            return types.Part.from_bytes(
-                data=base64.b64decode(image_data.base64_data),
-                mime_type=image_data.mime_type,
-            )
-
-        def process_audio_url(audio_url_dict: dict) -> types.Part:
-            url = audio_url_dict["url"]
-            mime_type = url.split(":")[1].split(";")[0]
-            audio_bytes = base64.b64decode(url.split(",", 1)[1])
-            return types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
-
-        def append_or_extend(
-            contents: list[types.Content],
-            part: list[types.Part],
-            content_cls: type[types.Content],
-        ) -> None:
-            # Only merge same-kind parts. Upstreams such as Vertex AI reject a
-            # Content mixing functionResponse with text/image parts with the
-            # misleading error "Requests ending with a model turn are not
-            # supported.", so runner-injected user messages that follow tool
-            # results must start a new Content instead of being merged.
-            part_has_function_response = any(
-                p.function_response is not None for p in part
-            )
-            if (
-                contents
-                and isinstance(contents[-1], content_cls)
-                and any(
-                    p.function_response is not None for p in (contents[-1].parts or [])
+            if role == "tool":
+                matches = [
+                    i
+                    for i, (call_id, _) in enumerate(pending)
+                    if call_id == message.get("tool_call_id") and i not in results
+                ]
+                if not matches:
+                    raise ValueError(
+                        f"Message {message_index}: tool result does not match the current batch."
+                    )
+                # Legacy duplicate name IDs are recoverable only in original order.
+                index = matches[0]
+                if len(matches) > 1 and index != len(results):
+                    raise ValueError(
+                        f"Message {message_index}: ambiguous legacy tool batch."
+                    )
+                call = pending[index][1]
+                result = types.FunctionResponse(
+                    name=call.name,
+                    response={"name": call.name, "content": message.get("content", "")},
                 )
-                == part_has_function_response
-            ):
-                assert contents[-1].parts is not None
-                contents[-1].parts.extend(part)
-            elif part:
-                # Skip empty part lists: a Content without parts is invalid
-                # for the Gemini API.
-                contents.append(content_cls(parts=part))
+                if call.id is not None:
+                    result.id = call.id
+                results[index] = types.Part(function_response=result)
+                if len(results) == len(pending):
+                    contents.append(
+                        types.UserContent(
+                            parts=[results[i] for i in range(len(pending))]
+                        )
+                    )
+                    pending = []
+                    results = {}
+                continue
 
-        gemini_contents: list[types.Content] = []
-        for message in payloads["messages"]:
-            role, content = message["role"], message.get("content")
-
-            if role == "user":
-                if isinstance(content, list):
-                    parts = []
-                    for item in content:
-                        if item["type"] == "text":
-                            parts.append(types.Part.from_text(text=item["text"] or " "))
-                        elif item["type"] == "image_url":
-                            parts.append(await process_image_url(item["image_url"]))
-                        else:
-                            parts.append(process_audio_url(item["audio_url"]))
-                else:
-                    parts = [create_text_part(content)]
-                append_or_extend(gemini_contents, parts, types.UserContent)
-
-            elif role == "assistant":
-                parts = []
-                if isinstance(content, str):
-                    parts.append(types.Part.from_text(text=content))
-                elif isinstance(content, list):
-                    thinking_signature = None
-                    text = ""
-                    for part in content:
-                        # for most cases, assistant content only contains two parts: think and text
-                        if part.get("type") == "think":
-                            thinking_signature = part.get("encrypted") or None
-                        else:
-                            text += str(part.get("text"))
-
-                    if thinking_signature and isinstance(thinking_signature, str):
-                        try:
-                            thinking_signature = base64.b64decode(thinking_signature)
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to decode google gemini thinking signature: {e}",
-                                exc_info=True,
-                            )
-                            thinking_signature = None
-
+            native = (message.get("provider_state") or {}).get("gemini")
+            if native is not None:
+                if native.get("version") != 1 or native.get("invalidated"):
+                    raise ValueError(
+                        f"Message {message_index}: unsupported or invalidated Gemini state."
+                    )
+                if native.get("display_only") is True:
+                    if role != "assistant" or message.get("tool_calls"):
+                        raise ValueError(
+                            f"Message {message_index}: display-only state cannot contain protocol calls."
+                        )
+                    continue
+                if native.get("view_digest") != message_view_digest(message):
+                    raise ValueError(
+                        f"Message {message_index}: Gemini snapshot revision changed; start a new turn without the edited signed history."
+                    )
+                if native.get("model") != model or native.get(
+                    "backend"
+                ) != protocol_content_digest(getattr(self, "api_base", None) or ""):
+                    raise ValueError(
+                        f"Message {message_index}: Gemini snapshot model/backend is incompatible; explicit migration is not enabled."
+                    )
+                if native.get("content_digest") != protocol_content_digest(
+                    native.get("content")
+                ):
+                    raise ValueError(
+                        f"Message {message_index}: native Part/signature integrity changed."
+                    )
+                try:
+                    original = types.Content.model_validate(native["content"])
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Message {message_index}: invalid native Content state."
+                    ) from exc
+                if original.role is None:
+                    original.role = "model"
+                elif original.role != "model":
+                    raise ValueError(
+                        f"Message {message_index}: native response state is not model-owned."
+                    )
+                parts = original.parts or []
+                calls = [
+                    (i, p.function_call)
+                    for i, p in enumerate(parts)
+                    if p.function_call is not None
+                ]
+                bindings = native.get("calls", [])
+                if len(calls) != len(bindings) or len(calls) != len(
+                    message.get("tool_calls") or []
+                ):
+                    raise ValueError(
+                        f"Message {message_index}: native tool batch bindings are incomplete."
+                    )
+                for (part_index, call), binding, tool in zip(
+                    calls, bindings, message.get("tool_calls") or []
+                ):
                     if (
-                        not text
-                        and thinking_signature
-                        and "tool_calls" in message
-                        and any(
-                            isinstance(tool, dict)
-                            and isinstance(tool.get("extra_content"), dict)
-                            and isinstance(tool["extra_content"].get("google"), dict)
-                            and tool["extra_content"]["google"].get("thought_signature")
-                            for tool in message["tool_calls"]
-                        )
+                        binding["part_index"] != part_index
+                        or binding["internal_id"] != tool["id"]
+                        or call.name != tool["function"]["name"]
+                        or (call.args or {})
+                        != json.loads(tool["function"].get("arguments") or "{}")
                     ):
-                        # If the main content is empty but tool calls have thought signatures,
-                        # skip adding an empty text part to deduplicate the thinking signature in the main content and tool calls.
-                        pass
-                    else:
+                        raise ValueError(
+                            f"Message {message_index}: native tool batch bindings changed."
+                        )
+                    pending.append((binding["internal_id"], call))
+                if (
+                    calls
+                    and native.get("requires_signature")
+                    and not parts[calls[0][0]].thought_signature
+                ):
+                    raise ValueError(
+                        f"Message {message_index}: Gemini state lost the required function-call signature; no placeholder will be injected."
+                    )
+                for instruction in native.get("request_suffix", []):
+                    contents.append(
+                        types.UserContent(
+                            parts=[types.Part.from_text(text=instruction)]
+                        )
+                    )
+                contents.append(original)
+                continue
+
+            parts: list[types.Part] = []
+            content = message.get("content")
+            if isinstance(content, str):
+                if content or role == "user":
+                    parts.append(types.Part.from_text(text=content or " "))
+            elif isinstance(content, list):
+                for part_index, item in enumerate(content):
+                    kind = item.get("type")
+                    if kind == "text":
+                        if item.get("text") or role == "user":
+                            parts.append(
+                                types.Part.from_text(text=item.get("text") or " ")
+                            )
+                    elif kind == "think":
+                        # Old ThinkPart has no reliable per-Part Google provenance.
+                        # Tool signatures are restored only from their own metadata.
+                        continue
+                    elif kind in {"image_url", "audio_url"}:
+                        media = await resolve_media_ref_to_base64_data(
+                            item[kind]["url"],
+                            media_type="image" if kind == "image_url" else "audio",
+                            strict=True,
+                        )
+                        if media is None:
+                            raise ValueError(
+                                f"Message {message_index} Part {part_index}: media unavailable."
+                            )
                         parts.append(
-                            types.Part(
-                                text=text,
-                                thought_signature=thinking_signature,
+                            types.Part.from_bytes(
+                                data=media.to_bytes(), mime_type=media.mime_type
                             )
                         )
-
-                if "tool_calls" in message:
-                    for tool in message["tool_calls"]:
-                        part = types.Part.from_function_call(
-                            name=tool["function"]["name"],
-                            args=json.loads(tool["function"]["arguments"]),
+                    else:
+                        raise ValueError(
+                            f"Message {message_index} Part {part_index}: unsupported content type."
                         )
-                        # we should set thought_signature back to part if exists
-                        # for more info about thought_signature, see:
-                        # https://ai.google.dev/gemini-api/docs/thought-signatures
-                        if "extra_content" in tool and tool["extra_content"]:
-                            ts_bs64 = (
-                                tool["extra_content"]
-                                .get("google", {})
-                                .get("thought_signature")
+            if role == "assistant":
+                for call_index, tool in enumerate(message.get("tool_calls") or []):
+                    name = tool["function"]["name"]
+                    if not name:
+                        raise ValueError(f"Message {message_index}: unnamed tool call.")
+                    args = json.loads(tool["function"].get("arguments") or "{}")
+                    call = types.FunctionCall(name=name, args=args)
+                    # Legacy IDs have unknown origin; do not infer native IDs from strings.
+                    part = types.Part(function_call=call)
+                    signature = (
+                        (tool.get("extra_content") or {}).get("google") or {}
+                    ).get("thought_signature")
+                    if signature:
+                        try:
+                            part.thought_signature = base64.b64decode(
+                                signature, validate=True
                             )
-                            if ts_bs64:
-                                part.thought_signature = base64.b64decode(ts_bs64)
-                        parts.append(part)
-
+                        except (ValueError, TypeError) as exc:
+                            raise ValueError(
+                                f"Message {message_index}: invalid tool signature encoding."
+                            ) from exc
+                    elif (
+                        call_index == 0
+                        and message_index > last_user_index
+                        and model.startswith(("gemini-3-", "gemini-3."))
+                    ):
+                        raise ValueError(
+                            f"Message {message_index}: current tool batch has no Gemini signature; source provenance is unknown and automatic migration is disabled."
+                        )
+                    parts.append(part)
+                    pending.append((tool["id"], call))
                 if not parts:
-                    parts = [types.Part.from_text(text=" ")]
-
-                append_or_extend(gemini_contents, parts, types.ModelContent)
-
-            elif role == "tool":
-                func_name = message.get("name", message["tool_call_id"])
-                part = types.Part.from_function_response(
-                    name=func_name,
-                    response={
-                        "name": func_name,
-                        "content": message["content"],
-                    },
-                )
-
-                parts = [part]
-                append_or_extend(gemini_contents, parts, types.UserContent)
-
-        if gemini_contents and isinstance(gemini_contents[0], types.ModelContent):
-            gemini_contents.pop(0)
-
-        return gemini_contents
+                    continue
+                contents.append(types.ModelContent(parts=parts))
+            elif role == "user" and parts:
+                if (
+                    contents
+                    and isinstance(contents[-1], types.UserContent)
+                    and not any(
+                        p.function_response is not None
+                        for p in contents[-1].parts or []
+                    )
+                ):
+                    contents[-1].parts.extend(parts)
+                else:
+                    contents.append(types.UserContent(parts=parts))
+        if pending:
+            raise ValueError("Final tool batch is missing results.")
+        if contents and contents[0].role == "model":
+            contents.pop(0)
+        return contents
 
     def _extract_reasoning_content(self, candidate: types.Candidate) -> str:
         """Extract reasoning content from candidate parts"""
@@ -497,7 +574,19 @@ class ProviderGoogleGenAI(Provider):
         has_text_output = bool((llm_response.completion_text or "").strip())
         has_reasoning_output = bool((llm_response.reasoning_content or "").strip())
         has_tool_output = bool(llm_response.tools_call_args)
-        if has_text_output or has_reasoning_output or has_tool_output:
+        has_media_output = bool(
+            llm_response.result_chain
+            and any(
+                isinstance(part, (Comp.Image, Comp.Record))
+                for part in llm_response.result_chain.chain
+            )
+        )
+        if (
+            has_text_output
+            or has_reasoning_output
+            or has_tool_output
+            or has_media_output
+        ):
             return
         raise EmptyModelOutputError(
             "Gemini completion has no usable output. "
@@ -510,10 +599,36 @@ class ProviderGoogleGenAI(Provider):
         llm_response: LLMResponse,
         *,
         validate_output: bool = True,
+        model: str | None = None,
     ) -> MessageChain:
-        """处理内容部分并构建消息链"""
+        """Parse one completed response and capture immutable protocol provenance.
+
+        Args:
+            candidate: Selected SDK candidate with original Part boundaries.
+            llm_response: Destination for display content and executable calls.
+            validate_output: Reject an otherwise unusable completion.
+            model: Actual requested model, including per-request overrides.
+
+        Returns:
+            The user-facing result chain, separate from the native snapshot.
+
+        Raises:
+            ValueError: A blocked or incomplete tool response cannot be executed.
+            EmptyModelOutputError: No usable content was returned.
+        """
+        finish_reason = candidate.finish_reason
+        if finish_reason is not None and finish_reason in {
+            types.FinishReason.SAFETY,
+            types.FinishReason.PROHIBITED_CONTENT,
+            types.FinishReason.SPII,
+            types.FinishReason.BLOCKLIST,
+            getattr(types.FinishReason, "IMAGE_SAFETY", None),
+        }:
+            raise ValueError(
+                f"Gemini candidate was blocked; finish_reason={finish_reason}."
+            )
         if not candidate.content:
-            logger.warning(f"Gemini candidate.content is empty: {candidate}")
+            logger.warning("Gemini candidate has no content.")
             if validate_output:
                 raise EmptyModelOutputError(
                     "Gemini candidate content is empty. "
@@ -525,23 +640,8 @@ class ProviderGoogleGenAI(Provider):
         finish_reason = candidate.finish_reason
         result_parts: list[types.Part] | None = candidate.content.parts
 
-        if finish_reason == types.FinishReason.SAFETY:
-            raise Exception("The model output failed Gemini platform safety checks.")
-
-        if finish_reason in {
-            types.FinishReason.PROHIBITED_CONTENT,
-            types.FinishReason.SPII,
-            types.FinishReason.BLOCKLIST,
-        }:
-            raise Exception("The model output violates Gemini platform policy.")
-
-        # 防止旧版本SDK不存在IMAGE_SAFETY
-        if hasattr(types.FinishReason, "IMAGE_SAFETY"):
-            if finish_reason == types.FinishReason.IMAGE_SAFETY:
-                raise Exception("The model output violates Gemini platform policy.")
-
         if not result_parts:
-            logger.warning(f"Gemini candidate.content.parts is empty: {candidate}")
+            logger.warning("Gemini candidate has no parts.")
             if validate_output:
                 raise EmptyModelOutputError(
                     "Gemini candidate content parts are empty. "
@@ -566,7 +666,41 @@ class ProviderGoogleGenAI(Provider):
             for part in result_parts
         ):
             chain.append(Comp.Plain("这是图片"))
-        for part in result_parts:
+        batch_id = uuid4().hex
+        target_model = model or getattr(self, "model_name", "")
+        native = {
+            "version": 1,
+            "model": target_model,
+            "backend": protocol_content_digest(getattr(self, "api_base", None) or ""),
+            "batch_id": batch_id,
+            "finish_reason": finish_reason.value if finish_reason is not None else None,
+            "content": candidate.content.model_dump(
+                mode="json", by_alias=True, exclude_none=True
+            ),
+            "calls": [],
+            "requires_signature": target_model.startswith(("gemini-3-", "gemini-3.")),
+        }
+        call_parts = [part for part in result_parts if part.function_call is not None]
+        native_ids = [
+            part.function_call.id
+            for part in call_parts
+            if part.function_call.id is not None
+        ]
+        if len(native_ids) != len(set(native_ids)):
+            raise ValueError(
+                "Gemini response contains duplicate native call IDs; no tools were executed."
+            )
+        if (
+            call_parts
+            and native["requires_signature"]
+            and not call_parts[0].thought_signature
+        ):
+            raise ValueError(
+                "Gemini response lacks the required function-call signature; no tools were executed."
+            )
+        llm_response.provider_state = {"gemini": native}
+        native["content_digest"] = protocol_content_digest(native["content"])
+        for part_index, part in enumerate(result_parts):
             # Skip thinking parts — their text is already captured via
             # _extract_reasoning_content above.  Including them here would
             # leak the model's internal reasoning into the user-facing message,
@@ -574,23 +708,37 @@ class ProviderGoogleGenAI(Provider):
             if part.text and not part.thought:
                 chain.append(Comp.Plain(part.text))
 
-            if (
-                part.function_call
-                and part.function_call.name is not None
-                and part.function_call.args is not None
-            ):
+            if part.function_call is not None:
+                call = part.function_call
+                if not call.name or not call.name.strip():
+                    raise ValueError(
+                        f"Gemini Part {part_index}: function call has no name."
+                    )
+                if getattr(call, "partial_args", None) is not None or getattr(
+                    call, "will_continue", None
+                ):
+                    raise ValueError(
+                        f"Gemini Part {part_index}: partial function arguments are unsupported; no tools were executed."
+                    )
+                if finish_reason and finish_reason != types.FinishReason.STOP:
+                    raise ValueError(
+                        "Gemini tool batch did not finish successfully; no tools were executed."
+                    )
                 llm_response.role = "tool"
-                llm_response.tools_call_name.append(part.function_call.name)
-                llm_response.tools_call_args.append(part.function_call.args)
-                # function_call.id might be None, use name as fallback
-                tool_call_id = part.function_call.id or part.function_call.name
+                llm_response.tools_call_name.append(call.name)
+                llm_response.tools_call_args.append(call.args or {})
+                tool_call_id = f"gemini_{batch_id}_{part_index}"
                 llm_response.tools_call_ids.append(tool_call_id)
-                # extra_content
-                if part.thought_signature:
-                    ts_bs64 = base64.b64encode(part.thought_signature).decode("utf-8")
-                    llm_response.tools_call_extra_content[tool_call_id] = {
-                        "google": {"thought_signature": ts_bs64}
+                native["calls"].append(
+                    {
+                        "internal_id": tool_call_id,
+                        "part_index": part_index,
+                        "upstream_id_state": "present"
+                        if call.id is not None
+                        else "absent",
+                        "upstream_id": call.id,
                     }
+                )
 
             if (
                 part.inline_data
@@ -600,11 +748,23 @@ class ProviderGoogleGenAI(Provider):
             ):
                 chain.append(Comp.Image.fromBytes(part.inline_data.data))
 
-            if ts := part.thought_signature:
-                # only keep the last thinking signature
-                llm_response.reasoning_signature = base64.b64encode(ts).decode("utf-8")
+            if (
+                part.inline_data
+                and part.inline_data.mime_type
+                and part.inline_data.mime_type.startswith("audio/")
+                and part.inline_data.data
+            ):
+                chain.append(
+                    Comp.Record.fromBase64(
+                        base64.b64encode(part.inline_data.data).decode("ascii")
+                    )
+                )
+
         chain_result = MessageChain(chain=chain)
         llm_response.result_chain = chain_result
+        llm_response.provider_state = llm_response.to_assistant_message(
+            bind_native_state=True
+        ).provider_state
         if validate_output:
             self._ensure_usable_response(
                 llm_response,
@@ -620,7 +780,16 @@ class ProviderGoogleGenAI(Provider):
         *,
         request_max_retries: int | None = None,
     ) -> LLMResponse:
-        """非流式请求 Gemini API"""
+        """Request one completion with bounded feature and transport retries.
+
+        Args:
+            payloads: Source messages, target model and generation overrides.
+            tools: Current tool declarations.
+            request_max_retries: Maximum transport attempts, including the first.
+
+        Returns:
+            Display output and native state for the completed model response.
+        """
         system_instruction = next(
             (msg["content"] for msg in payloads["messages"] if msg["role"] == "system"),
             None,
@@ -633,6 +802,10 @@ class ProviderGoogleGenAI(Provider):
             modalities.append("IMAGE")
 
         conversation = await self._prepare_conversation(payloads)
+        if not conversation or conversation[-1].role == "model":
+            raise ValueError(
+                "Gemini request is empty or ends with a model turn; provide actual user input or tool results."
+            )
         temperature = payloads.get("temperature", 0.7)
 
         result: types.GenerateContentResponse | None = None
@@ -655,20 +828,38 @@ class ProviderGoogleGenAI(Provider):
                     ),
                     max_attempts=request_max_retries,
                 )
-                logger.debug(f"genai result: {result}")
+                logger.debug(
+                    "Gemini response received; candidates=%d",
+                    len(result.candidates or []),
+                )
 
                 if not result.candidates:
-                    logger.error(
-                        f"Gemini request failed: candidates is empty: {result}"
+                    logger.error("Gemini response has no candidates.")
+                    reason = (
+                        result.prompt_feedback.block_reason
+                        if result.prompt_feedback
+                        else None
                     )
-                    raise Exception("Gemini request failed: candidates is empty.")
+                    if (
+                        reason
+                        and reason != types.BlockedReason.BLOCKED_REASON_UNSPECIFIED
+                    ):
+                        raise ValueError(
+                            f"Gemini prompt was blocked; block_reason={reason}."
+                        )
+                    raise EmptyModelOutputError(
+                        f"Gemini response has no candidates; block_reason={reason}."
+                    )
 
                 if result.candidates[0].finish_reason == types.FinishReason.RECITATION:
-                    if temperature > 2:
+                    current_temperature = (
+                        config.temperature if config.temperature is not None else 0.7
+                    )
+                    if current_temperature >= 2:
                         raise Exception(
                             "Temperature exceeded the maximum value of 2, but Gemini recitation still occurred."
                         )
-                    temperature += 0.2
+                    temperature = min(2.0, round(current_temperature + 0.2, 10))
                     logger.warning(
                         f"Gemini recitation detected; increasing temperature to {temperature:.1f} and retrying...",
                     )
@@ -680,11 +871,15 @@ class ProviderGoogleGenAI(Provider):
                 if e.message is None:
                     e.message = ""
                 if "Developer instruction is not enabled" in e.message:
+                    if system_instruction is None:
+                        raise
                     logger.warning(
                         f"{model} does not support system prompts; removing it automatically. This may affect persona settings.",
                     )
                     system_instruction = None
                 elif "Function calling is not enabled" in e.message:
+                    if tools is None:
+                        raise
                     logger.warning(
                         f"{model} does not support function calling; removing tools automatically."
                     )
@@ -695,6 +890,8 @@ class ProviderGoogleGenAI(Provider):
                     in e.message
                     or "only supports text output" in e.message
                 ):
+                    if modalities == ["TEXT"]:
+                        raise
                     logger.warning(
                         f"{model} does not support multimodal output; falling back to TEXT modality.",
                     )
@@ -703,15 +900,19 @@ class ProviderGoogleGenAI(Provider):
                     raise
                 continue
 
-        llm_response = LLMResponse("assistant")
+        llm_response = LLMResponse("assistant", id=result.response_id)
         llm_response.raw_completion = result
         llm_response.result_chain = self._process_content_parts(
             result.candidates[0],
             llm_response,
+            model=model,
         )
         llm_response.id = result.response_id
         if result.usage_metadata:
             llm_response.usage = self._extract_usage(result.usage_metadata)
+            llm_response.provider_state["gemini"]["usage_metadata"] = (
+                result.usage_metadata.model_dump(mode="json", exclude_none=True)
+            )
         return llm_response
 
     async def _query_stream(
@@ -721,13 +922,29 @@ class ProviderGoogleGenAI(Provider):
         *,
         request_max_retries: int | None = None,
     ) -> AsyncGenerator[LLMResponse, None]:
-        """流式请求 Gemini API"""
+        """Yield display deltas, then one validated complete protocol response.
+
+        Args:
+            payloads: Source messages, target model and generation overrides.
+            tools: Current tool declarations.
+            request_max_retries: Maximum transport attempts, including the first.
+
+        Yields:
+            Incremental display responses and a single final response at EOF.
+
+        Raises:
+            ValueError: A tool stream is partial, incomplete or blocked.
+        """
         system_instruction = next(
             (msg["content"] for msg in payloads["messages"] if msg["role"] == "system"),
             None,
         )
         model = payloads.get("model", self.get_model())
         conversation = await self._prepare_conversation(payloads)
+        if not conversation or conversation[-1].role == "model":
+            raise ValueError(
+                "Gemini request is empty or ends with a model turn; provide actual user input or tool results."
+            )
 
         result = None
         while True:
@@ -738,13 +955,29 @@ class ProviderGoogleGenAI(Provider):
                     payloads.get("tool_choice", "auto"),
                     system_instruction,
                 )
-                result = await retry_provider_request(
-                    "Gemini",
-                    lambda: self.client.models.generate_content_stream(
+
+                async def open_stream():
+                    """Open the request through its first item before any display.
+
+                    Returns:
+                        The live iterator and its first response, if any.
+                    """
+                    stream = await self.client.models.generate_content_stream(
                         model=model,
                         contents=cast(types.ContentListUnion, conversation),
                         config=config,
-                    ),
+                    )
+                    try:
+                        first = await anext(stream, None)
+                    except BaseException:
+                        if hasattr(stream, "aclose"):
+                            await stream.aclose()
+                        raise
+                    return stream, first
+
+                result, first_chunk = await retry_provider_request(
+                    "Gemini",
+                    open_stream,
                     max_attempts=request_max_retries,
                 )
                 break
@@ -752,11 +985,15 @@ class ProviderGoogleGenAI(Provider):
                 if e.message is None:
                     e.message = ""
                 if "Developer instruction is not enabled" in e.message:
+                    if system_instruction is None:
+                        raise
                     logger.warning(
                         f"{model} does not support system prompts; removing it automatically. This may affect persona settings.",
                     )
                     system_instruction = None
                 elif "Function calling is not enabled" in e.message:
+                    if tools is None:
+                        raise
                     logger.warning(
                         f"{model} does not support function calling; removing tools automatically."
                     )
@@ -765,87 +1002,109 @@ class ProviderGoogleGenAI(Provider):
                     raise
                 continue
 
-        # Accumulate the complete response text for the final response
-        accumulated_text = ""
-        accumulated_reasoning = ""
-        final_response = None
-
-        async for chunk in result:
-            llm_response = LLMResponse("assistant", is_chunk=True)
-
-            if not chunk.candidates:
-                logger.warning(f"Gemini stream chunk has empty candidates: {chunk}")
-                continue
-            if not chunk.candidates[0].content:
-                logger.warning(f"Gemini stream chunk has empty content: {chunk}")
-                continue
-
-            if chunk.candidates[0].content.parts and any(
-                part.function_call for part in chunk.candidates[0].content.parts
-            ):
-                llm_response = LLMResponse("assistant", is_chunk=False)
-                llm_response.raw_completion = chunk
-                llm_response.result_chain = self._process_content_parts(
-                    chunk.candidates[0],
-                    llm_response,
-                    validate_output=False,
-                )
-                llm_response.id = chunk.response_id
-                if chunk.usage_metadata:
-                    llm_response.usage = self._extract_usage(chunk.usage_metadata)
-                yield llm_response
-                return
-
-            _f = False
-
-            # 提取 reasoning content
-            reasoning = self._extract_reasoning_content(chunk.candidates[0])
-            if reasoning:
-                _f = True
-                accumulated_reasoning += reasoning
-                llm_response.reasoning_content = reasoning
-            if chunk.text:
-                _f = True
-                accumulated_text += chunk.text
-                llm_response.result_chain = MessageChain(chain=[Comp.Plain(chunk.text)])
-            if _f:
-                yield llm_response
-
-            if chunk.candidates[0].finish_reason:
-                # Process the final chunk for potential tool calls or other content
-                if chunk.candidates[0].content.parts:
-                    final_response = LLMResponse("assistant", is_chunk=False)
-                    final_response.raw_completion = chunk
-                    final_response.result_chain = self._process_content_parts(
-                        chunk.candidates[0],
-                        final_response,
-                        validate_output=False,
+        parts: list[types.Part] = []
+        usage = None
+        response_id = None
+        finish_reason = None
+        selected_index = None
+        try:
+            chunk = first_chunk
+            while chunk is not None:
+                if (
+                    chunk.prompt_feedback
+                    and chunk.prompt_feedback.block_reason
+                    and chunk.prompt_feedback.block_reason
+                    != types.BlockedReason.BLOCKED_REASON_UNSPECIFIED
+                ):
+                    raise ValueError(
+                        f"Gemini prompt was blocked; block_reason={chunk.prompt_feedback.block_reason}."
                     )
-                    final_response.id = chunk.response_id
-                    if chunk.usage_metadata:
-                        final_response.usage = self._extract_usage(chunk.usage_metadata)
-                break
-
-        # Yield final complete response with accumulated text
-        if not final_response:
-            final_response = LLMResponse("assistant", is_chunk=False)
-
-        # Set the complete accumulated reasoning in the final response
-        if accumulated_reasoning:
-            final_response.reasoning_content = accumulated_reasoning
-
-        # Set the complete accumulated text in the final response
-        if accumulated_text:
-            final_response.result_chain = MessageChain(
-                chain=[Comp.Plain(accumulated_text)],
+                if chunk.usage_metadata is not None:
+                    usage = (
+                        chunk.usage_metadata
+                        if usage is None
+                        else usage.model_copy(
+                            update=chunk.usage_metadata.model_dump(exclude_none=True)
+                        )
+                    )
+                if chunk.response_id:
+                    response_id = chunk.response_id
+                for candidate in chunk.candidates or []:
+                    candidate_index = (
+                        candidate.index if candidate.index is not None else 0
+                    )
+                    if selected_index is None:
+                        selected_index = candidate_index
+                    if candidate_index != selected_index:
+                        continue
+                    if candidate.finish_reason is not None:
+                        finish_reason = candidate.finish_reason
+                    display = []
+                    thoughts = []
+                    for part in (
+                        candidate.content.parts if candidate.content else None
+                    ) or []:
+                        part = part.model_copy(deep=True)
+                        call = part.function_call
+                        if call is not None and (
+                            getattr(call, "partial_args", None) is not None
+                            or getattr(call, "will_continue", None)
+                        ):
+                            raise ValueError(
+                                "Gemini stream contains unsupported partial function arguments; no tools were executed."
+                            )
+                        if part.text and part.thought:
+                            thoughts.append(part.text)
+                        elif part.text:
+                            display.append(Comp.Plain(part.text))
+                        # The SDK yields delta text and complete FC Parts by default.
+                        # Only unsigned plain text deltas are concatenated. Signed,
+                        # empty-metadata, media and call Parts retain their boundaries.
+                        data = part.model_dump(exclude_none=True)
+                        previous = (
+                            parts[-1].model_dump(exclude_none=True) if parts else {}
+                        )
+                        if (
+                            data.keys() <= {"text", "thought"}
+                            and "text" in data
+                            and previous.keys() <= {"text", "thought"}
+                            and "text" in previous
+                            and part.thought == parts[-1].thought
+                        ):
+                            parts[-1].text = (parts[-1].text or "") + (part.text or "")
+                        else:
+                            parts.append(part)
+                    if display or thoughts:
+                        yield LLMResponse(
+                            "assistant",
+                            is_chunk=True,
+                            result_chain=MessageChain(chain=display),
+                            reasoning_content="".join(thoughts) or None,
+                        )
+                chunk = await anext(result, None)
+        finally:
+            if hasattr(result, "aclose"):
+                await result.aclose()
+        if finish_reason is None and any(
+            part.function_call is not None for part in parts
+        ):
+            raise ValueError(
+                "Gemini tool stream ended without a completion reason; no tools were executed."
             )
-
-        self._ensure_usable_response(
-            final_response,
-            response_id=getattr(final_response, "id", None),
-            finish_reason=None,
+        candidate = types.Candidate(
+            content=types.Content(role="model", parts=parts),
+            finish_reason=finish_reason,
         )
-
+        final_response = LLMResponse("assistant", id=response_id)
+        self._process_content_parts(candidate, final_response, model=model)
+        final_response.raw_completion = types.GenerateContentResponse(
+            candidates=[candidate], response_id=response_id, usage_metadata=usage
+        )
+        if usage is not None:
+            final_response.usage = self._extract_usage(usage)
+            final_response.provider_state["gemini"]["usage_metadata"] = (
+                usage.model_dump(mode="json", exclude_none=True)
+            )
         yield final_response
 
     async def text_chat(
@@ -969,18 +1228,24 @@ class ProviderGoogleGenAI(Provider):
         keys = self.api_keys.copy()
 
         for _ in range(retry):
+            stream_started = False
             try:
                 async for response in self._query_stream(
                     payloads,
                     func_tool,
                     request_max_retries=request_max_retries,
                 ):
+                    stream_started = True
                     yield response
                 break
             except APIError as e:
+                if stream_started:
+                    raise
                 if await self._handle_api_error(e, keys):
                     continue
-                break
+                raise
+        else:
+            raise RuntimeError("Gemini streaming request exhausted its retry limit.")
 
     async def get_models(self):
         try:

@@ -197,10 +197,12 @@ class Provider(AbstractProvider):
         for message in messages:
             if is_checkpoint_message(message):
                 continue
-            if isinstance(message, Message):
-                dicts.append(message.model_dump())
-            else:
-                dicts.append(message)
+            data = (
+                message.model_dump() if isinstance(message, Message) else dict(message)
+            )
+            if not getattr(self, "preserve_native_message_state", False):
+                data.pop("provider_state", None)
+            dicts.append(data)
 
         return dicts
 

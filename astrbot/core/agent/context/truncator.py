@@ -1,3 +1,5 @@
+from collections import Counter
+
 from ..message import Message
 
 
@@ -67,8 +69,14 @@ class ContextTruncator:
         def flush_pending_if_valid() -> None:
             nonlocal pending_assistant, pending_tools
             if pending_assistant is not None and pending_tools:
-                fixed_messages.append(pending_assistant)
-                fixed_messages.extend(pending_tools)
+                expected = Counter(
+                    call.get("id") if isinstance(call, dict) else call.id
+                    for call in pending_assistant.tool_calls or []
+                )
+                actual = Counter(tool.tool_call_id for tool in pending_tools)
+                if expected == actual:
+                    fixed_messages.append(pending_assistant)
+                    fixed_messages.extend(pending_tools)
             pending_assistant = None
             pending_tools = []
 

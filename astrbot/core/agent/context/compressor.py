@@ -270,6 +270,9 @@ class LLMSummaryCompressor:
             self.provider.provider_config.get("modalities", None),
         )
         log_context_sanitize_stats(sanitize_stats)
+        if not getattr(self.provider, "preserve_native_message_state", False):
+            for message in sanitized_summary_contexts:
+                message.pop("provider_state", None)
 
         # Generate summary
         try:

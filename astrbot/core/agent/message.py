@@ -1,10 +1,13 @@
 # Inspired by MoonshotAI/kosong, credits to MoonshotAI/kosong authors for the original implementation.
 # License: Apache License 2.0
 
+import hashlib
+import json
 from typing import Any, ClassVar, Literal, TypeVar, cast
 
 from pydantic import (
     BaseModel,
+    Field,
     GetCoreSchemaHandler,
     PrivateAttr,
     ValidationError,
@@ -95,7 +98,7 @@ class ThinkPart(ContentPart):
 
     type: str = "think"
     think: str
-    encrypted: str | None = None
+    encrypted: str | None = Field(default=None, repr=False)
     """Encrypted thinking content, or signature."""
 
     def merge_in_place(self, other: Any) -> bool:
@@ -165,7 +168,7 @@ class ToolCall(BaseModel):
     """The ID of the tool call."""
     function: FunctionBody
     """The function body of the tool call."""
-    extra_content: dict[str, Any] | None = None
+    extra_content: dict[str, Any] | None = Field(default=None, repr=False)
     """Extra metadata for the tool call."""
 
     @model_serializer(mode="wrap")
@@ -212,6 +215,9 @@ class Message(BaseModel):
     tool_call_id: str | None = None
     """The ID of the tool call."""
 
+    provider_state: dict[str, Any] | None = Field(default=None, repr=False)
+    """Optional versioned protocol state; never a generic provider wire field."""
+
     _no_save: bool = PrivateAttr(default=False)
     _checkpoint_after: CheckpointData | None = PrivateAttr(default=None)
 
@@ -243,6 +249,8 @@ class Message(BaseModel):
             data.pop("tool_calls", None)
         if self.tool_call_id is None:
             data.pop("tool_call_id", None)
+        if self.provider_state is None:
+            data.pop("provider_state", None)
         return data
 
 
@@ -353,9 +361,52 @@ def dump_messages_with_checkpoints(messages: list[Message]) -> list[dict]:
                 for part in message.content
                 if not getattr(part, "_no_save", False)
             ]
+        native = (message.provider_state or {}).get("gemini")
+        if native and native.get("display_only") is True:
+            message_data["provider_state"] = {
+                "gemini": {"version": native.get("version"), "display_only": True}
+            }
+        elif native and (
+            native.get("view_digest") != message_view_digest(message_data)
+            or native.get("content_digest")
+            != protocol_content_digest(native.get("content"))
+        ):
+            # Never persist raw content excluded by edits or persistence flags.
+            message_data["provider_state"] = {
+                "gemini": {"version": 1, "invalidated": True}
+            }
         dumped.append(message_data)
         if message._checkpoint_after is not None:
             dumped.append(
                 CheckpointMessageSegment(content=message._checkpoint_after).model_dump()
             )
     return dumped
+
+
+def message_view_digest(message: dict) -> str:
+    """Fingerprint the visible message independently of opaque provider state.
+
+    Args:
+        message: A serialized logical message.
+
+    Returns:
+        A digest that changes when content, calls or persistence flags change.
+    """
+    view = {key: message.get(key) for key in ("role", "content", "tool_calls")}
+    return protocol_content_digest(view)
+
+
+def protocol_content_digest(content: Any) -> str:
+    """Fingerprint JSON-safe protocol data without logging or exposing it.
+
+    Args:
+        content: Persistable content or a logical message view.
+
+    Returns:
+        A deterministic digest for detecting edits and serialization loss.
+    """
+    return hashlib.sha256(
+        json.dumps(
+            content, sort_keys=True, ensure_ascii=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()

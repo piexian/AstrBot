@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 import sys
 import time
 import traceback
@@ -53,7 +54,6 @@ from ..context.manager import ContextManager
 from ..context.token_counter import EstimateTokenCounter, TokenCounter
 from ..hooks import BaseAgentRunHooks
 from ..message import (
-    AssistantMessageSegment,
     Message,
     ToolCallMessageSegment,
     bind_checkpoint_messages,
@@ -183,19 +183,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self._transition_state(AgentState.DONE)
         self.stats.end_time = time.time()
 
-        parts = []
-        if llm_resp.reasoning_content is not None or llm_resp.reasoning_signature:
-            parts.append(
-                ThinkPart(
-                    think=llm_resp.reasoning_content or "",
-                    encrypted=llm_resp.reasoning_signature,
-                )
-            )
-        if llm_resp.completion_text:
-            parts.append(TextPart(text=llm_resp.completion_text))
-        if len(parts) == 0:
-            logger.warning("LLM returned empty assistant message with no tool calls.")
-        self.run_context.messages.append(Message(role="assistant", content=parts))
+        self.run_context.messages.append(llm_resp.to_assistant_message())
 
         try:
             await self.agent_hooks.on_agent_done(self.run_context, llm_resp)
@@ -628,7 +616,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     "Chat Model %s request error: %s",
                     candidate_id,
                     exc,
-                    exc_info=True,
+                    exc_info=not isinstance(exc, ValueError),
                 )
                 continue
 
@@ -653,6 +641,17 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         self,
         contexts: list[Message] | list[dict[str, T.Any]],
     ) -> list[Message] | list[dict[str, T.Any]]:
+        if not getattr(self.provider, "preserve_native_message_state", False):
+            contexts = [
+                message.model_copy(update={"provider_state": None})
+                if isinstance(message, Message)
+                else {
+                    key: value
+                    for key, value in message.items()
+                    if key != "provider_state"
+                }
+                for message in contexts
+            ]
         modalities = self.provider.provider_config.get("modalities", None)
         if (
             not modalities
@@ -938,7 +937,35 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         # 如果有工具调用，还需处理工具调用
         if llm_resp.tools_call_name:
             if self.tool_schema_mode == "skills_like":
-                requery_resp, _ = await self._resolve_tool_exec(llm_resp)
+                first_text = llm_resp.completion_text or ""
+                first_reasoning = llm_resp.reasoning_content
+                gemini_requery = bool(
+                    llm_resp.provider_state and "gemini" in llm_resp.provider_state
+                )
+                requery_completed = False
+                try:
+                    requery_resp, _ = await self._resolve_tool_exec(llm_resp)
+                    requery_completed = not self._is_stop_requested()
+                finally:
+                    if (
+                        gemini_requery
+                        and not requery_completed
+                        and (first_text or first_reasoning)
+                    ):
+                        display_parts = []
+                        if first_reasoning:
+                            display_parts.append(ThinkPart(think=first_reasoning))
+                        if first_text:
+                            display_parts.append(TextPart(text=first_text))
+                        self.run_context.messages.append(
+                            Message(
+                                role="assistant",
+                                content=display_parts,
+                                provider_state={
+                                    "gemini": {"version": 1, "display_only": True}
+                                },
+                            )
+                        )
                 if self._is_stop_requested():
                     yield await self._finalize_aborted_step()
                     return
@@ -969,12 +996,39 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                             ),
                         )
 
+                    # Yielded chains may still be held by streaming consumers.
+                    # Bind the combined display history on a separate response.
+                    llm_resp = copy.copy(llm_resp)
+                    llm_resp.result_chain = copy.deepcopy(llm_resp.result_chain)
+                    if gemini_requery and first_text:
+                        llm_resp.completion_text = "\n".join(
+                            filter(None, [first_text, llm_resp.completion_text])
+                        )
+                    if gemini_requery and first_reasoning:
+                        llm_resp.reasoning_content = "\n".join(
+                            filter(None, [first_reasoning, llm_resp.reasoning_content])
+                        )
+                    if llm_resp.provider_state:
+                        llm_resp.provider_state = llm_resp.to_assistant_message(
+                            bind_native_state=True
+                        ).provider_state
                     await self._complete_with_assistant_response(llm_resp)
                     return
                 else:
                     llm_resp.tools_call_name = requery_resp.tools_call_name
                     llm_resp.tools_call_args = requery_resp.tools_call_args
                     llm_resp.tools_call_ids = requery_resp.tools_call_ids
+                    llm_resp.tools_call_extra_content = copy.deepcopy(
+                        requery_resp.tools_call_extra_content
+                    )
+                    llm_resp.provider_state = copy.deepcopy(requery_resp.provider_state)
+                    llm_resp.raw_completion = requery_resp.raw_completion
+                    if gemini_requery:
+                        llm_resp.reasoning_signature = requery_resp.reasoning_signature
+                    if llm_resp.provider_state:
+                        llm_resp.provider_state = llm_resp.to_assistant_message(
+                            bind_native_state=True
+                        ).provider_state
 
             tool_call_result_blocks = []
             cached_images = []  # Collect cached images for LLM visibility
@@ -1004,24 +1058,9 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                 yield await self._finalize_aborted_step()
                 return
 
-            # 将结果添加到上下文中
-            parts = []
-            if llm_resp.reasoning_content is not None or llm_resp.reasoning_signature:
-                parts.append(
-                    ThinkPart(
-                        think=llm_resp.reasoning_content or "",
-                        encrypted=llm_resp.reasoning_signature,
-                    )
-                )
-            if llm_resp.completion_text:
-                parts.append(TextPart(text=llm_resp.completion_text))
-            if len(parts) == 0:
-                parts = None
+            # Commit display content together with the actual execution state.
             tool_calls_result = ToolCallsResult(
-                tool_calls_info=AssistantMessageSegment(
-                    tool_calls=llm_resp.to_openai_tool_calls_model(),
-                    content=parts,
-                ),
+                tool_calls_info=llm_resp.to_assistant_message(),
                 tool_calls_result=tool_call_result_blocks,
             )
             # record the assistant message with tool calls
@@ -1102,8 +1141,55 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         req: ProviderRequest,
         llm_response: LLMResponse,
     ) -> T.AsyncGenerator[_HandleFunctionToolsResult, None]:
-        """处理函数工具调用。"""
+        """Execute a validated blocking batch and emit one final result per call.
+
+        Args:
+            req: Request owning the available tool set.
+            llm_response: Complete tool calls and optional native bindings.
+
+        Yields:
+            Display events, cached media and the completed result batch.
+
+        Raises:
+            ValueError: Call lists or native bindings are invalid before execution.
+        """
         tool_call_result_blocks: list[ToolCallMessageSegment] = []
+        if not (
+            len(llm_response.tools_call_name)
+            == len(llm_response.tools_call_args)
+            == len(llm_response.tools_call_ids)
+        ):
+            raise ValueError("Tool call list lengths differ; no tools were executed.")
+        if len(set(llm_response.tools_call_ids)) != len(llm_response.tools_call_ids):
+            raise ValueError("Tool call batch contains duplicate internal IDs.")
+        if any(
+            args is not None and not isinstance(args, dict)
+            for args in llm_response.tools_call_args
+        ):
+            raise ValueError(
+                "Tool call arguments must be objects; no tools were executed."
+            )
+        native = (llm_response.provider_state or {}).get("gemini")
+        if native:
+            message_state = llm_response.to_assistant_message().provider_state
+            if not message_state or message_state["gemini"].get("invalidated"):
+                raise ValueError("Native tool response state changed before execution.")
+            bindings = native.get("calls", [])
+            if len(bindings) != len(llm_response.tools_call_ids):
+                raise ValueError("Native tool batch bindings have different lengths.")
+            for index, binding in enumerate(bindings):
+                call = native["content"]["parts"][binding["part_index"]]["functionCall"]
+                if (
+                    binding["internal_id"] != llm_response.tools_call_ids[index]
+                    or call["name"] != llm_response.tools_call_name[index]
+                    or json.dumps(call.get("args") or {}, sort_keys=True)
+                    != json.dumps(
+                        llm_response.tools_call_args[index] or {}, sort_keys=True
+                    )
+                ):
+                    raise ValueError(
+                        "Native tool call binding changed before execution."
+                    )
         logger.info(f"Agent 使用工具: {llm_response.tools_call_name}")
 
         def _append_tool_call_result(tool_call_id: str, content: str) -> None:
@@ -1160,7 +1246,7 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                 #  Some API may return None for tools with no parameters
                 if func_tool_args is None:
                     func_tool_args = {}
-                logger.info(f"使用工具：{func_tool_name}，参数：{func_tool_args}")
+                logger.info("Executing tool %s", func_tool_name)
 
                 if not func_tool:
                     logger.warning(f"未找到指定的工具: {func_tool_name}，将跳过。")
@@ -1353,6 +1439,17 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                 )
 
             if len(tool_call_result_blocks) > tool_result_blocks_start:
+                if len(tool_call_result_blocks) > tool_result_blocks_start + 1:
+                    # Multiple executor events belong to one blocking call.
+                    combined = "\n\n".join(
+                        str(block.content)
+                        for block in tool_call_result_blocks[tool_result_blocks_start:]
+                    )
+                    tool_call_result_blocks[tool_result_blocks_start:] = [
+                        ToolCallMessageSegment(
+                            tool_call_id=func_tool_id, content=combined
+                        )
+                    ]
                 tool_result_content = str(tool_call_result_blocks[-1].content)
                 yield _HandleFunctionToolsResult.from_message_chain(
                     MessageChain(
@@ -1368,7 +1465,11 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         ],
                     )
                 )
-                logger.info(f"Tool `{func_tool_name}` Result: {tool_result_content}")
+                logger.info(
+                    "Tool %s completed; result length=%d",
+                    func_tool_name,
+                    len(tool_result_content),
+                )
 
         # 处理函数调用响应
         if tool_call_result_blocks:
@@ -1447,6 +1548,14 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                 if requery_resp:
                     llm_resp = requery_resp
                     self._sanitize_malformed_tool_calls(llm_resp)
+                    if llm_resp.provider_state and "gemini" in llm_resp.provider_state:
+                        llm_resp.provider_state["gemini"]["request_suffix"] = [
+                            contexts[-1]["content"]
+                        ]
+                else:
+                    raise ValueError(
+                        "Tool requery returned no response; candidate calls were not executed."
+                    )
 
                 # If the re-query still returns no tool calls, and also does not have a meaningful assistant reply,
                 # we consider it as a failure of the LLM to follow the tool-use instruction,
@@ -1479,6 +1588,17 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                     if repair_resp:
                         llm_resp = repair_resp
                         self._sanitize_malformed_tool_calls(llm_resp)
+                        if (
+                            llm_resp.provider_state
+                            and "gemini" in llm_resp.provider_state
+                        ):
+                            llm_resp.provider_state["gemini"]["request_suffix"] = [
+                                repair_contexts[-1]["content"]
+                            ]
+                    else:
+                        raise ValueError(
+                            "Tool requery repair returned no response; candidate calls were not executed."
+                        )
 
         return llm_resp, subset
 

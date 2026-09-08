@@ -513,6 +513,13 @@ class InternalAgentSubStage(Stage):
             not llm_response.completion_text
             and not req.tool_calls_result
             and not user_aborted
+            and not (
+                llm_response.result_chain
+                and any(
+                    isinstance(part, (Image, Record))
+                    for part in llm_response.result_chain.chain
+                )
+            )
         ):
             logger.debug("The LLM response is empty; not saving a record.")
             return

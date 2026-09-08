@@ -233,102 +233,115 @@ class ToolSet:
         return result
 
     def google_schema(self) -> dict:
-        """Convert tools to Google GenAI API format."""
+        """Build lossless JSON Schema declarations for Google GenerateContent.
 
-        def convert_schema(schema: dict) -> dict:
-            """Convert schema to Gemini API format."""
-            supported_types = {
-                "string",
-                "number",
-                "integer",
-                "boolean",
-                "array",
-                "object",
-                "null",
-            }
-            supported_formats = {
-                "string": {"enum", "date-time"},
-                "integer": {"int32", "int64"},
-                "number": {"float", "double"},
-            }
+        Returns:
+            Declarations using parameters_json_schema, never both schema fields.
 
-            if "anyOf" in schema:
-                return {"anyOf": [convert_schema(s) for s in schema["anyOf"]]}
-
-            result = {}
-
-            # Avoid side effects by not modifying the original schema
-            origin_type = schema.get("type")
-            target_type = origin_type
-
-            # Compatibility fix: Gemini API expects 'type' to be a string (enum),
-            # but standard JSON Schema (MCP) allows lists (e.g. ["string", "null"]).
-            # We fallback to the first non-null type.
-            if isinstance(origin_type, list):
-                target_type = next((t for t in origin_type if t != "null"), "string")
-
-            if target_type in supported_types:
-                result["type"] = target_type
-                if "format" in schema and schema["format"] in supported_formats.get(
-                    result["type"],
-                    set(),
-                ):
-                    result["format"] = schema["format"]
-            else:
-                result["type"] = "null"
-
-            support_fields = {
-                "title",
-                "description",
-                "enum",
-                "minimum",
-                "maximum",
-                "maxItems",
-                "minItems",
-                "nullable",
-                "required",
-            }
-            result.update({k: schema[k] for k in support_fields if k in schema})
-
-            if "properties" in schema:
-                properties = {}
-                for key, value in schema["properties"].items():
-                    prop_value = convert_schema(value)
-                    if "default" in prop_value:
-                        del prop_value["default"]
-                    # see #5217
-                    if "additionalProperties" in prop_value:
-                        del prop_value["additionalProperties"]
-                    properties[key] = prop_value
-
-                if properties:
-                    result["properties"] = properties
-
-            if target_type == "array":
-                items_schema = schema.get("items")
-                if isinstance(items_schema, dict):
-                    result["items"] = convert_schema(items_schema)
-                else:
-                    # Gemini requires array schemas to include an `items` schema.
-                    # JSON Schema allows omitting it, so fall back to a permissive
-                    # string item schema instead of emitting an invalid declaration.
-                    result["items"] = {"type": "string"}
-
-            return result
-
-        tools = []
+        Raises:
+            ValueError: A local reference is invalid/cyclic or expansion exceeds
+                the bounded budget. Remote references are never fetched.
+        """
+        declarations = []
         for tool in self.tools:
-            d: dict[str, Any] = {"name": tool.name}
+            definition: dict[str, Any] = {"name": tool.name}
             if tool.description:
-                d["description"] = tool.description
+                definition["description"] = tool.description
             if tool.parameters:
-                d["parameters"] = convert_schema(tool.parameters)
-            tools.append(d)
+                root = tool.parameters
+                nodes = 0
 
-        declarations = {}
-        if tools:
-            declarations["function_declarations"] = tools
-        return declarations
+                def expand(
+                    schema, path: str, refs: tuple[str, ...] = (), depth: int = 0
+                ):
+                    nonlocal nodes
+                    nodes += 1
+                    if nodes > 2048 or depth > 32:
+                        raise ValueError(
+                            f"Tool {tool.name} schema {path}: reference expansion limit exceeded."
+                        )
+                    if isinstance(schema, bool):
+                        return schema
+                    if not isinstance(schema, dict):
+                        raise ValueError(
+                            f"Tool {tool.name} schema {path}: expected a schema object or boolean."
+                        )
+                    if "$ref" in schema:
+                        ref = schema["$ref"]
+                        if not isinstance(ref, str) or not (
+                            ref == "#" or ref.startswith("#/")
+                        ):
+                            raise ValueError(
+                                f"Tool {tool.name} schema {path}: remote ref unsupported; supply a local definition."
+                            )
+                        if ref in refs:
+                            raise ValueError(
+                                f"Tool {tool.name} schema {path}: cyclic ref unsupported."
+                            )
+                        target = root
+                        try:
+                            for token in ref[2:].split("/") if ref != "#" else []:
+                                target = target[
+                                    token.replace("~1", "/").replace("~0", "~")
+                                ]
+                        except (KeyError, TypeError) as exc:
+                            raise ValueError(
+                                f"Tool {tool.name} schema {path}: unresolved local ref."
+                            ) from exc
+                        resolved = expand(target, path, (*refs, ref), depth + 1)
+                        siblings = {
+                            key: value for key, value in schema.items() if key != "$ref"
+                        }
+                        if siblings:
+                            return {
+                                "allOf": [
+                                    resolved,
+                                    expand(siblings, path, refs, depth + 1),
+                                ]
+                            }
+                        return resolved
+                    result = {}
+                    for key, value in schema.items():
+                        child_path = f"{path}/{key}"
+                        if key in {"$defs", "definitions"}:
+                            continue
+                        if key in {
+                            "properties",
+                            "patternProperties",
+                            "dependentSchemas",
+                        }:
+                            result[key] = {
+                                name: expand(
+                                    child, f"{child_path}/{name}", refs, depth + 1
+                                )
+                                for name, child in value.items()
+                            }
+                        elif key in {"allOf", "anyOf", "oneOf", "prefixItems"}:
+                            result[key] = [
+                                expand(child, f"{child_path}/{i}", refs, depth + 1)
+                                for i, child in enumerate(value)
+                            ]
+                        elif key in {
+                            "items",
+                            "additionalProperties",
+                            "not",
+                            "if",
+                            "then",
+                            "else",
+                            "contains",
+                            "propertyNames",
+                            "unevaluatedProperties",
+                            "unevaluatedItems",
+                            "additionalItems",
+                        }:
+                            result[key] = expand(value, child_path, refs, depth + 1)
+                        else:
+                            result[key] = copy.deepcopy(value)
+                    return result
+
+                definition["parameters_json_schema"] = expand(root, "#")
+            declarations.append(definition)
+        return {"function_declarations": declarations} if declarations else {}
 
     @deprecated(reason="Use openai_schema() instead", version="4.0.0")
     def get_func_desc_openai_style(self, omit_empty_parameter_field: bool = False):

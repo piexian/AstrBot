@@ -48,7 +48,7 @@ def load_tool_module():
     return module
 
 
-def test_google_schema_fills_missing_array_items_with_string_schema():
+def test_google_json_schema_preserves_unrestricted_array_items():
     tool_module = load_tool_module()
     FunctionTool = tool_module.FunctionTool
     ToolSet = tool_module.ToolSet
@@ -69,12 +69,12 @@ def test_google_schema_fills_missing_array_items_with_string_schema():
     )
 
     schema = ToolSet([tool]).google_schema()
-    source_uuids = schema["function_declarations"][0]["parameters"]["properties"][
-        "source_uuids"
-    ]
+    source_uuids = schema["function_declarations"][0]["parameters_json_schema"][
+        "properties"
+    ]["source_uuids"]
 
     assert source_uuids["type"] == "array"
-    assert source_uuids["items"] == {"type": "string"}
+    assert "items" not in source_uuids
 
 
 def test_openai_schema_sorts_tools_by_name_without_mutating_toolset_order():

@@ -1636,6 +1636,86 @@ async def test_c_history_audio_and_model_media_keep_roles(sdk_provider, tmp_path
     ] == ["image/png", "audio/wav"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "object", "properties": {"value": {"type": ["string", "null"]}}},
+        {
+            "type": "object",
+            "properties": {
+                "value": {
+                    "anyOf": [{"type": "string"}, {"type": "integer"}],
+                    "description": "keep",
+                    "enum": ["a", 1],
+                }
+            },
+        },
+        {
+            "type": "object",
+            "properties": {"value": {"type": "array"}},
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "value": {"oneOf": [{"type": "string"}, {"type": "integer"}]}
+            },
+        },
+    ],
+)
+async def test_c_json_schema_semantics_reach_http(sdk_provider, schema):
+    provider, requests, _ = sdk_provider
+    before = copy.deepcopy(schema)
+    tools = ToolSet([FunctionTool(name="one", description="test", parameters=schema)])
+    await provider.text_chat(prompt="test", func_tool=tools)
+    declaration = requests[0]["tools"][0]["functionDeclarations"][0]
+    assert "parameters" not in declaration
+    assert (
+        declaration.get(
+            "parametersJsonSchema", declaration.get("parameters_json_schema")
+        )
+        == schema
+    )
+    assert schema == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ref", ["https://example.invalid/schema", "#/$defs/Missing", "#/$defs/Loop"]
+)
+async def test_c_bad_schema_references_fail_locally(sdk_provider, ref):
+    provider, requests, _ = sdk_provider
+    schema = {
+        "type": "object",
+        "properties": {"value": {"$ref": ref}},
+        "$defs": {"Loop": {"$ref": "#/$defs/Loop"}},
+    }
+    tools = ToolSet([FunctionTool(name="one", description="test", parameters=schema)])
+    with pytest.raises(ValueError, match="one.*ref|one.*cyclic"):
+        await provider.text_chat(prompt="test", func_tool=tools)
+    assert not requests
+
+
+@pytest.mark.asyncio
+async def test_c_local_ref_keeps_sibling_constraints(sdk_provider):
+    provider, requests, _ = sdk_provider
+    schema = {
+        "type": "object",
+        "properties": {"value": {"$ref": "#/$defs/a~1b", "maxLength": 5}},
+        "$defs": {"a/b": {"type": "string", "minLength": 1}},
+    }
+    tools = ToolSet([FunctionTool(name="one", description="test", parameters=schema)])
+    await provider.text_chat(prompt="test", func_tool=tools)
+    declaration = requests[0]["tools"][0]["functionDeclarations"][0]
+    raw = declaration.get(
+        "parametersJsonSchema", declaration.get("parameters_json_schema")
+    )
+    assert raw["properties"]["value"] == {
+        "allOf": [{"type": "string", "minLength": 1}, {"maxLength": 5}]
+    }
+
+
 @pytest.mark.parametrize("tool_ids", [["a"], ["a", "a"], ["a", "wrong"]])
 def test_h_truncation_does_not_keep_partial_tool_batch(tool_ids):
     from astrbot.core.agent.context.truncator import ContextTruncator

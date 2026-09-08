@@ -130,6 +130,43 @@ async def sdk_provider(request):
         client.close()
 
 
+@pytest.mark.asyncio
+async def test_r_mixed_batch_counts_and_orders_every_result(sdk_provider):
+    provider, _, _ = sdk_provider
+
+    class BatchExecutor(ResultExecutor):
+        async def execute(self, tool, run_context, **kwargs):
+            self.calls.append(tool.name)
+            content = (
+                TextContent(type="text", text="known")
+                if len(self.calls) == 1
+                else AudioContent(type="audio", data="AA==", mimeType="audio/wav")
+            )
+            yield CallToolResult(content=[content])
+
+    executor = BatchExecutor([])
+    runner = await reset_runner(provider, executor)
+    response = LLMResponse(
+        "tool",
+        tools_call_name=["one", "one"],
+        tools_call_args=[{}, {}],
+        tools_call_ids=["a", "b"],
+    )
+    events = [
+        event async for event in runner._handle_function_tools(runner.req, response)
+    ]
+    results = [
+        block for event in events for block in event.tool_call_result_blocks or []
+    ]
+    assert [result.tool_call_id for result in results] == ["a", "b"]
+    assert Counter(result.tool_call_id for result in results) == Counter(
+        response.tools_call_ids
+    )
+    assert results[0].content == "known"
+    assert "adapter" in results[1].content
+    assert executor.calls == ["one", "one"]
+
+
 def wire_contents(request):
     """Normalize only known protobuf aliases, retaining every field and value.
 
@@ -319,3 +356,51 @@ async def test_a_runner_image_and_max_steps_reach_sdk(
     assert any("inlineData" in p for p in contents[-1]["parts"])
     assert all("functionResponse" not in p for p in contents[-1]["parts"])
     assert not requests[-1]["generationConfig"].get("tools")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind", ["audio", "resource_link", "mixed", "empty", "exhausted", "error"]
+)
+async def test_r_tool_result_has_exactly_one_final_response(sdk_provider, kind):
+    provider, _, _ = sdk_provider
+    audio = AudioContent(type="audio", data="AA==", mimeType="audio/wav")
+    link = ResourceLink(
+        type="resource_link", name="test", uri="https://example.invalid/private"
+    )
+    content = {
+        "audio": [audio],
+        "resource_link": [link],
+        "mixed": [TextContent(type="text", text="known"), audio],
+        "empty": [],
+    }
+    results = (
+        []
+        if kind == "exhausted"
+        else [RuntimeError("executor failed")]
+        if kind == "error"
+        else [CallToolResult(content=content[kind])]
+    )
+    executor = ResultExecutor(results)
+    runner = await reset_runner(provider, executor)
+    response = LLMResponse(
+        role="tool",
+        tools_call_name=["one"],
+        tools_call_args=[{}],
+        tools_call_ids=["call-one"],
+    )
+    events = [
+        event async for event in runner._handle_function_tools(runner.req, response)
+    ]
+    blocks = [
+        block for event in events for block in (event.tool_call_result_blocks or [])
+    ]
+    assert Counter(block.tool_call_id for block in blocks) == Counter({"call-one": 1})
+    assert len(executor.calls) == 1
+    text = blocks[0].content
+    if kind in {"audio", "resource_link", "mixed"}:
+        assert "adapter" in text and "unsupported" in text
+    if kind == "mixed":
+        assert "known" in text
+    if kind == "exhausted":
+        assert "without returning" in text

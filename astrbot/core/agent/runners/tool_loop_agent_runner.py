@@ -1277,6 +1277,11 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                                     result_parts.append(
                                         "The tool has returned a data type that is not supported."
                                     )
+                            else:
+                                result_parts.append(
+                                    "The tool result adapter received an unsupported "
+                                    f"content type: {type(content_item).__name__}."
+                                )
                         if result_parts:
                             inline_result = "\n\n".join(result_parts)
                             inline_result = await self._materialize_large_tool_result(
@@ -1319,6 +1324,12 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                                 func_tool_name, tool_call_streak
                             ),
                         )
+
+                if len(tool_call_result_blocks) == tool_result_blocks_start:
+                    _append_tool_call_result(
+                        func_tool_id,
+                        "The tool executor finished without returning content.",
+                    )
 
                 try:
                     await self.agent_hooks.on_tool_end(

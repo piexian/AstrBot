@@ -1,35 +1,16 @@
 """Gemini protocol tests through the real SDK HTTP transport (no live API)."""
 
 import base64
-
-
 import copy
-
-
 import io
-
-
 import json
-
-
 from collections import Counter
 
-
 import httpx
-
-
 import pytest
-
-
 import pytest_asyncio
-
-
 from google import genai
-
-
 from google.genai import types
-
-
 from mcp.types import (
     AudioContent,
     CallToolResult,
@@ -37,29 +18,14 @@ from mcp.types import (
     ResourceLink,
     TextContent,
 )
-
-
 from PIL import Image
 
-
 from astrbot.core.agent.hooks import BaseAgentRunHooks
-
-
 from astrbot.core.agent.message import Message, dump_messages_with_checkpoints
-
-
 from astrbot.core.agent.run_context import ContextWrapper
-
-
 from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
-
-
 from astrbot.core.agent.tool import FunctionTool, ToolSet
-
-
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
-
-
 from astrbot.core.provider.sources.gemini_source import ProviderGoogleGenAI
 
 
@@ -307,6 +273,40 @@ async def test_h_expired_legacy_media_fails_without_replaying_other_content(
 
 
 @pytest.mark.asyncio
+async def test_c_signed_model_media_never_runs_input_transcoding(
+    sdk_provider, monkeypatch
+):
+    provider, requests, _ = sdk_provider
+    original = types.ModelContent(
+        parts=[
+            types.Part.from_bytes(
+                data=base64.b64decode(png_data()), mime_type="image/png"
+            )
+        ]
+    )
+    original.parts[0].thought_signature = b"\xff\x01"
+    response = LLMResponse("assistant")
+    provider._process_content_parts(types.Candidate(content=original), response)
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("Model media must not enter the input resolver")
+
+    monkeypatch.setattr(
+        "astrbot.core.provider.sources.gemini_source.resolve_media_ref_to_base64_data",
+        forbidden,
+    )
+    await provider.text_chat(
+        contexts=[
+            Message(role="user", content="start"),
+            response.to_assistant_message(),
+            Message(role="user", content="continue"),
+        ]
+    )
+    actual = types.Content.model_validate(requests[-1]["contents"][1])
+    assert actual.parts == original.parts
+
+
+@pytest.mark.asyncio
 async def test_b_edited_call_arguments_fail_before_execution(sdk_provider):
     provider, _, _ = sdk_provider
     response = LLMResponse("assistant")
@@ -353,6 +353,15 @@ async def test_h_opaque_state_corruption_is_not_persisted(sdk_provider):
 
 
 @pytest.mark.asyncio
+async def test_c_partial_usage_never_produces_negative_input(sdk_provider):
+    provider, _, _ = sdk_provider
+    usage = provider._extract_usage(
+        types.GenerateContentResponseUsageMetadata(cached_content_token_count=5)
+    )
+    assert usage.input_other == 0 and usage.input_cached == 5
+
+
+@pytest.mark.asyncio
 async def test_s_partial_usage_tail_preserves_prior_fields(sdk_provider):
     provider, _, replies = sdk_provider
     replies.append(
@@ -391,6 +400,13 @@ async def test_h_provenance_contains_no_endpoint_credentials(sdk_provider):
     )
     saved = response.to_assistant_message().model_dump_json()
     assert "private-password" not in saved and "private-token" not in saved
+
+
+@pytest.mark.asyncio
+async def test_c_flash_preserves_existing_disabled_thinking_default(sdk_provider):
+    provider, _, _ = sdk_provider
+    config = await provider._prepare_query_config({"model": "gemini-2.5-flash"})
+    assert config.thinking_config.thinking_budget == 0
 
 
 @pytest.mark.asyncio
@@ -529,6 +545,179 @@ async def test_s_runner_streaming_history_replays_actual_execution(sdk_provider,
     assert calls[0]["thoughtSignature"] == (
         "c2Vjb25k" if mode == "skills_like" else "Zmlyc3Q="
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("blocked", ["prompt", "candidate"])
+async def test_c_blocked_responses_are_not_empty_output_retries(
+    sdk_provider, streaming, blocked
+):
+    provider, _, replies = sdk_provider
+    reply = (
+        {"promptFeedback": {"blockReason": "SAFETY"}}
+        if blocked == "prompt"
+        else {"candidates": [{"finishReason": "SAFETY"}]}
+    )
+    replies.append([reply] if streaming else reply)
+    with pytest.raises(ValueError, match="SAFETY"):
+        if streaming:
+            _ = [result async for result in provider.text_chat_stream(prompt="test")]
+        else:
+            await provider.text_chat(prompt="test")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model,budget",
+    [
+        ("gemini-2.5-flash", -2),
+        ("gemini-2.5-flash", 24577),
+        ("gemini-2.5-flash-lite", 128),
+        ("gemini-2.5-flash", "invalid"),
+    ],
+)
+async def test_c_known_thinking_budget_rejects_invalid_explicit_values(
+    sdk_provider, model, budget
+):
+    provider, _, _ = sdk_provider
+    provider.provider_config["gm_thinking_config"] = {"budget": budget}
+    with pytest.raises(ValueError, match="thinking budget"):
+        await provider._prepare_query_config({"model": model})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["user", "assistant"])
+async def test_c_unknown_parts_are_not_reinterpreted_as_audio_or_text(
+    sdk_provider, role
+):
+    provider, requests, _ = sdk_provider
+    contexts = [
+        {"role": "user", "content": "start"},
+        {
+            "role": role,
+            "content": [
+                {"type": "future", "audio_url": {"url": "data:audio/wav;base64,AA=="}}
+            ],
+        },
+        {"role": "user", "content": "continue"},
+    ]
+    with pytest.raises(ValueError, match="unsupported content type"):
+        await provider.text_chat(contexts=contexts)
+    assert requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode,reason",
+    [
+        ("regular", "system"),
+        ("regular", "tools"),
+        ("regular", "modalities"),
+        ("stream", "system"),
+        ("stream", "tools"),
+    ],
+)
+async def test_c_repeated_feature_errors_stop_after_one_adaptation(
+    sdk_provider, mode, reason
+):
+    from google.genai.errors import APIError
+    from unittest.mock import AsyncMock
+
+    provider, _, _ = sdk_provider
+    message = {
+        "system": "Developer instruction is not enabled",
+        "tools": "Function calling is not enabled",
+        "modalities": "Multi-modal output is not supported",
+    }[reason]
+    request = AsyncMock(
+        side_effect=[
+            APIError(400, {"error": {"message": message}}),
+            APIError(400, {"error": {"message": message}}),
+            AssertionError("unbounded adaptation"),
+        ]
+    )
+    provider.provider_config["gm_resp_image_modal"] = True
+    tools = ToolSet(
+        [FunctionTool(name="one", description="test", parameters={"type": "object"})]
+    )
+    payload = {
+        "messages": [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "test"},
+        ]
+    }
+    with pytest.raises(APIError):
+        if mode == "regular":
+            provider.client.models.generate_content = request
+            await provider._query(payload, tools, request_max_retries=1)
+        else:
+            provider.client.models.generate_content_stream = request
+            _ = [
+                item
+                async for item in provider._query_stream(
+                    payload, tools, request_max_retries=1
+                )
+            ]
+    assert request.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_c_production_sdk_retry_composition_honors_attempt_limit(
+    monkeypatch, streaming
+):
+    from google.genai.errors import APIError
+    from unittest.mock import AsyncMock
+
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(
+            503, json={"error": {"code": 503, "message": "offline overload"}}
+        )
+
+    original_client = genai.Client
+    clients = []
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as transport:
+
+        def client_factory(*args, **kwargs):
+            kwargs["http_options"].httpx_async_client = transport
+            client = original_client(*args, **kwargs)
+            clients.append(client)
+            return client
+
+        monkeypatch.setattr(
+            "astrbot.core.provider.sources.gemini_source.genai.Client", client_factory
+        )
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        provider = ProviderGoogleGenAI(
+            {
+                "id": "offline",
+                "key": ["offline-key"],
+                "model": "gemini-2.5-flash",
+                "api_base": "https://offline.invalid",
+            },
+            {},
+        )
+        try:
+            with pytest.raises(APIError):
+                if streaming:
+                    _ = [
+                        item
+                        async for item in provider.text_chat_stream(
+                            prompt="test", request_max_retries=2
+                        )
+                    ]
+                else:
+                    await provider.text_chat(prompt="test", request_max_retries=2)
+            assert len(requests) == 2
+        finally:
+            await provider.client.aclose()
+            await provider._http_client.aclose()
+            for client in clients:
+                client.close()
 
 
 def wire_contents(request):
@@ -835,6 +1024,26 @@ async def test_k_other_providers_keep_matching_first_thinking_signature(sdk_prov
     _ = [event async for event in runner.step_until_done(2)]
     thought = runner.run_context.messages[1].content[0]
     assert thought.think == "first reasoning" and thought.encrypted == "first signature"
+
+
+@pytest.mark.asyncio
+async def test_c_key_rotation_logs_no_key_prefix(sdk_provider, monkeypatch, caplog):
+    from google.genai.errors import APIError
+    from unittest.mock import AsyncMock
+
+    provider, _, _ = sdk_provider
+    provider.chosen_api_key = "offline-sensitive-first"
+    monkeypatch.setattr(
+        provider, "set_key", lambda key: setattr(provider, "chosen_api_key", key)
+    )
+    monkeypatch.setattr(
+        "astrbot.core.provider.sources.gemini_source.asyncio.sleep", AsyncMock()
+    )
+    await provider._handle_api_error(
+        APIError(429, {"error": {"message": "rate limited"}}),
+        ["offline-sensitive-first", "offline-sensitive-second"],
+    )
+    assert "offline-sens" not in caplog.text
 
 
 class ResultExecutor:
@@ -1172,7 +1381,7 @@ async def test_s_sdk_stream_collects_parallel_calls_and_usage_tail(sdk_provider)
     assert final[0].tools_call_args == [{"x": 1}, {"x": 2}]
     assert final[0].completion_text == "before "
     assert final[0].usage.input == 10
-    assert final[0].usage.output == 5
+    assert final[0].usage.output == 8
     assert len(final[0].provider_state["gemini"]["content"]["parts"]) == 3
 
 
@@ -1310,6 +1519,123 @@ async def test_s_incomplete_calls_do_not_commit(sdk_provider, parts, finish):
         _ = [r async for r in provider.text_chat_stream(prompt="start")]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_c_generation_kwargs_reach_sdk_with_zero_values(sdk_provider, streaming):
+    provider, requests, replies = sdk_provider
+    provider.provider_config["temperature"] = 1.2
+    provider.provider_config["presence_penalty"] = 1.0
+    kwargs = {
+        "temperature": 0,
+        "top_p": 0,
+        "topP": 0.9,
+        "seed": 0,
+        "max_output_tokens": 8,
+        "response_logprobs": False,
+        "frequency_penalty": 0,
+        "presence_penalty": None,
+        "abort_signal": object(),
+    }
+    if streaming:
+        replies.append(
+            [
+                {
+                    "candidates": [
+                        {
+                            "content": {"role": "model", "parts": [{"text": "ok"}]},
+                            "finishReason": "STOP",
+                        }
+                    ]
+                }
+            ]
+        )
+        _ = [r async for r in provider.text_chat_stream(prompt="test", **kwargs)]
+    else:
+        await provider.text_chat(prompt="test", **kwargs)
+    config = requests[0]["generationConfig"]
+    assert config["temperature"] == 0
+    assert config["topP"] == 0
+    assert config["seed"] == 0
+    assert config["maxOutputTokens"] == 8
+    assert config["responseLogprobs"] is False
+    assert config["frequencyPenalty"] == 0
+    assert "presencePenalty" not in config
+    assert "abort_signal" not in json.dumps(requests[0])
+
+
+@pytest.mark.asyncio
+async def test_c_recitation_does_not_send_temperature_above_two(sdk_provider):
+    provider, requests, replies = sdk_provider
+    replies.extend(
+        [
+            {
+                "candidates": [
+                    {
+                        "content": {"role": "model", "parts": [{"text": "blocked"}]},
+                        "finishReason": "RECITATION",
+                    }
+                ]
+            }
+        ]
+        * 5
+    )
+    with pytest.raises(Exception):
+        await provider._query(
+            {
+                "model": provider.model_name,
+                "messages": [{"role": "user", "content": "start"}],
+                "temperature": 1.9,
+            },
+            None,
+        )
+    assert len(requests) <= 2
+    assert all(0 <= r["generationConfig"]["temperature"] <= 2 for r in requests)
+
+
+@pytest.mark.asyncio
+async def test_c_pro_default_budget_is_not_invalid_zero(sdk_provider):
+    provider, _, _ = sdk_provider
+    provider.provider_config = {}
+    config = await provider._prepare_query_config({"model": "gemini-2.5-pro"})
+    assert config.thinking_config is None or config.thinking_config.thinking_budget in (
+        None,
+        -1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_c_history_audio_and_model_media_keep_roles(sdk_provider, tmp_path):
+    import wave
+
+    provider, requests, _ = sdk_provider
+    audio = tmp_path / "history.wav"
+    with wave.open(str(audio), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(8000)
+        output.writeframes(b"\x00\x00" * 16)
+    history = [
+        {"role": "user", "content": "start"},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{png_data()}"},
+                },
+                {"type": "audio_url", "audio_url": {"url": str(audio)}},
+            ],
+        },
+        {"role": "user", "content": "continue"},
+    ]
+    await provider.text_chat(contexts=history)
+    model = wire_contents(requests[0])[1]
+    assert model["role"] == "model"
+    assert [
+        types.Part.model_validate(p).inline_data.mime_type for p in model["parts"]
+    ] == ["image/png", "audio/wav"]
+
+
 @pytest.mark.parametrize("tool_ids", [["a"], ["a", "a"], ["a", "wrong"]])
 def test_h_truncation_does_not_keep_partial_tool_batch(tool_ids):
     from astrbot.core.agent.context.truncator import ContextTruncator
@@ -1329,6 +1655,17 @@ def test_h_truncation_does_not_keep_partial_tool_batch(tool_ids):
         Message(role="tool", tool_call_id=name, content="result") for name in tool_ids
     )
     assert ContextTruncator().fix_messages(messages) == []
+
+
+@pytest.mark.asyncio
+async def test_c_known_pro_minimal_and_unknown_alias_thinking(sdk_provider):
+    provider, _, _ = sdk_provider
+    provider.provider_config["gm_thinking_config"] = {"level": "MINIMAL"}
+    with pytest.raises(ValueError, match="thinking"):
+        await provider._prepare_query_config({"model": "gemini-3.1-pro-preview"})
+    provider.provider_config["gm_thinking_config"] = {"budget": 1024}
+    config = await provider._prepare_query_config({"model": "gateway-alias"})
+    assert config.thinking_config.thinking_budget == 1024
 
 
 @pytest.mark.asyncio
@@ -1484,6 +1821,60 @@ async def test_h_generic_and_third_party_provider_never_receive_native_state(
 
 
 @pytest.mark.asyncio
+async def test_c_model_tail_and_blocked_response_are_diagnostic(sdk_provider):
+    provider, requests, replies = sdk_provider
+    with pytest.raises(ValueError, match="model"):
+        await provider.text_chat(
+            contexts=[
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "model tail"},
+            ]
+        )
+    assert not requests
+    replies.append({"promptFeedback": {"blockReason": "SAFETY"}})
+    with pytest.raises(Exception, match="SAFETY"):
+        await provider.text_chat(prompt="test")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_c_pure_media_is_usable_and_persistable(sdk_provider, streaming):
+    provider, requests, replies = sdk_provider
+    reply = {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"inlineData": {"mimeType": "audio/wav", "data": "AA=="}}
+                    ],
+                },
+                "finishReason": "STOP",
+            }
+        ]
+    }
+    replies.append([reply] if streaming else reply)
+    if streaming:
+        result = [r async for r in provider.text_chat_stream(prompt="test")][-1]
+    else:
+        result = await provider.text_chat(prompt="test")
+    message = result.to_assistant_message()
+    assert message.content[0].type == "audio_url"
+    await provider.text_chat(
+        contexts=[
+            {"role": "user", "content": "start"},
+            message,
+            {"role": "user", "content": "continue"},
+        ]
+    )
+    assert [
+        types.Part.model_validate(p) for p in wire_contents(requests[-1])[1]["parts"]
+    ] == [
+        types.Part.model_validate(p) for p in reply["candidates"][0]["content"]["parts"]
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("error", ["missing_finish", "truncated", "cancelled"])
 async def test_s_interrupted_stream_cannot_submit_calls(sdk_provider, error):
     import asyncio
@@ -1628,6 +2019,42 @@ async def test_s_chunk_layouts_preserve_signatures_and_candidate_isolation(
     ).parts
     assert len(parts) == 2
     assert parts[1].text == "" and parts[1].thought_signature == b"\xff\x00"
+
+
+@pytest.mark.asyncio
+async def test_c_media_only_history_is_saved(sdk_provider):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal import (
+        InternalAgentSubStage,
+    )
+    from astrbot.core.db.po import Conversation
+
+    provider, _, _ = sdk_provider
+    response = LLMResponse("assistant")
+    provider._process_content_parts(
+        types.Candidate(
+            content=types.ModelContent(
+                parts=[types.Part.from_bytes(data=b"\x00", mime_type="audio/wav")]
+            )
+        ),
+        response,
+        validate_output=False,
+    )
+    stage = InternalAgentSubStage()
+    stage.conv_manager = AsyncMock()
+    request = ProviderRequest(
+        conversation=Conversation(platform_id="test", user_id="test", cid="offline")
+    )
+    event = SimpleNamespace(unified_msg_origin="test", get_extra=lambda key: None)
+    await stage._save_to_history(
+        event,
+        request,
+        response,
+        [Message(role="user", content="start"), response.to_assistant_message()],
+        None,
+    )
+    stage.conv_manager.update_conversation.assert_awaited_once()
 
 
 @pytest.mark.asyncio

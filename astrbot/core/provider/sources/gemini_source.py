@@ -53,6 +53,18 @@ logging.getLogger("google_genai.types").addFilter(SuppressNonTextPartsWarning())
 )
 class ProviderGoogleGenAI(Provider):
     preserve_native_message_state = True
+    GENERATION_PARAMETERS = {
+        "temperature": ("temperature",),
+        "max_output_tokens": ("max_output_tokens", "max_tokens", "maxOutputTokens"),
+        "top_p": ("top_p", "topP"),
+        "top_k": ("top_k", "topK"),
+        "frequency_penalty": ("frequency_penalty", "frequencyPenalty"),
+        "presence_penalty": ("presence_penalty", "presencePenalty"),
+        "stop_sequences": ("stop_sequences", "stop", "stopSequences"),
+        "response_logprobs": ("response_logprobs", "responseLogprobs"),
+        "logprobs": ("logprobs",),
+        "seed": ("seed",),
+    }
     CATEGORY_MAPPING = {
         "harassment": types.HarmCategory.HARM_CATEGORY_HARASSMENT,
         "hate_speech": types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -169,9 +181,24 @@ class ProviderGoogleGenAI(Provider):
         tool_choice: Literal["auto", "required"] = "auto",
         system_instruction: str | None = None,
         modalities: list[str] | None = None,
-        temperature: float = 0.7,
+        temperature: float | None = None,
     ) -> types.GenerateContentConfig:
-        """准备查询配置"""
+        """Build shared generation configuration without leaking local controls.
+
+        Args:
+            payloads: Model, generation overrides and request metadata.
+            tools: Current tool declaration set.
+            tool_choice: Whether client tools are optional or required.
+            system_instruction: The original system instruction.
+            modalities: Requested response modalities.
+            temperature: Optional bounded recitation-retry override.
+
+        Returns:
+            An SDK configuration with validated, prioritized generation fields.
+
+        Raises:
+            ValueError: An explicit setting or tool schema is unsupported.
+        """
         if not modalities:
             modalities = ["TEXT"]
 
@@ -205,7 +232,7 @@ class ProviderGoogleGenAI(Provider):
                 tool_list.append(types.Tool(url_context=types.UrlContext()))
 
         if tools:
-            func_desc = tools.get_func_desc_google_genai_style()
+            func_desc = tools.google_schema()
             tool_list.append(
                 types.Tool(function_declarations=func_desc["function_declarations"]),
             )
@@ -240,12 +267,46 @@ class ProviderGoogleGenAI(Provider):
         ]:
             # The thinkingBudget parameter, introduced with the Gemini 2.5 series
             thinking_budget = self.provider_config.get("gm_thinking_config", {}).get(
-                "budget", 0
+                "budget",
+                None
+                if model_name in {"gemini-2.5-pro", "gemini-2.5-pro-preview"}
+                else 0,
             )
             if thinking_budget is not None:
-                thinking_config = types.ThinkingConfig(
-                    thinking_budget=thinking_budget,
-                )
+                try:
+                    thinking_config = types.ThinkingConfig(
+                        thinking_budget=thinking_budget
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "Gemini thinking budget must be an integer."
+                    ) from exc
+                thinking_budget = thinking_config.thinking_budget
+                if (
+                    model_name in {"gemini-2.5-pro", "gemini-2.5-pro-preview"}
+                    and thinking_budget != -1
+                    and not 128 <= thinking_budget <= 32768
+                ):
+                    raise ValueError(
+                        "Gemini 2.5 Pro thinking budget must be -1 or between 128 and 32768."
+                    )
+                if (
+                    model_name in {"gemini-2.5-flash", "gemini-2.5-flash-preview"}
+                    and thinking_budget != -1
+                    and not 0 <= thinking_budget <= 24576
+                ):
+                    raise ValueError(
+                        "Gemini 2.5 Flash thinking budget must be -1 or between 0 and 24576."
+                    )
+                if (
+                    model_name
+                    in {"gemini-2.5-flash-lite", "gemini-2.5-flash-lite-preview"}
+                    and thinking_budget not in {-1, 0}
+                    and not 512 <= thinking_budget <= 24576
+                ):
+                    raise ValueError(
+                        "Gemini 2.5 Flash Lite thinking budget must be -1, 0 or between 512 and 24576."
+                    )
         elif any(model_name.startswith(p) for p in ("gemini-3-", "gemini-3.")):
             # The thinkingLevel parameter, recommended for Gemini 3 models and onwards.
             # Use prefix match so new variants (3.1, 3-flash-lite-preview, etc.) are
@@ -256,6 +317,13 @@ class ProviderGoogleGenAI(Provider):
             )
             if thinking_level and isinstance(thinking_level, str):
                 thinking_level = thinking_level.upper()
+                if (
+                    model_name.startswith("gemini-3.1-pro")
+                    and thinking_level == "MINIMAL"
+                ):
+                    raise ValueError(
+                        "Gemini 3.1 Pro does not support MINIMAL thinking."
+                    )
                 allowed_levels = {"MINIMAL", "LOW", "MEDIUM", "HIGH"}
                 fallback_level = "HIGH"
                 if model_name.startswith("gemini-3.7"):
@@ -272,23 +340,45 @@ class ProviderGoogleGenAI(Provider):
                 thinking_config = types.ThinkingConfig(
                     thinking_level=types.ThinkingLevel(thinking_level)
                 )
+        else:
+            requested = self.provider_config.get("gm_thinking_config") or {}
+            if requested:
+                if (
+                    requested.get("budget") is not None
+                    and requested.get("level") is not None
+                ):
+                    raise ValueError(
+                        "Unknown Gemini model: configure either thinking budget or level, not both."
+                    )
+                logger.warning(
+                    "Thinking capability for the configured model alias is unverified; preserving explicit configuration."
+                )
+                thinking_config = types.ThinkingConfig(
+                    thinking_budget=requested.get("budget"),
+                    thinking_level=requested.get("level"),
+                )
 
+        generation = {"temperature": 0.7}
+        for source in (
+            self.provider_config,
+            payloads,
+            payloads.get("generation_overrides", {}),
+        ):
+            for field, aliases in self.GENERATION_PARAMETERS.items():
+                for alias in aliases:
+                    if alias in source:
+                        generation[field] = source[alias]
+                        break
+        if temperature is not None:
+            generation["temperature"] = temperature
+        if (
+            generation["temperature"] is not None
+            and not 0 <= generation["temperature"] <= 2
+        ):
+            raise ValueError("Gemini temperature must be between 0 and 2.")
         return types.GenerateContentConfig(
             system_instruction=system_instruction,
-            temperature=temperature,
-            max_output_tokens=payloads.get("max_tokens")
-            or payloads.get("maxOutputTokens"),
-            top_p=payloads.get("top_p") or payloads.get("topP"),
-            top_k=payloads.get("top_k") or payloads.get("topK"),
-            frequency_penalty=payloads.get("frequency_penalty")
-            or payloads.get("frequencyPenalty"),
-            presence_penalty=payloads.get("presence_penalty")
-            or payloads.get("presencePenalty"),
-            stop_sequences=payloads.get("stop") or payloads.get("stopSequences"),
-            response_logprobs=payloads.get("response_logprobs")
-            or payloads.get("responseLogprobs"),
-            logprobs=payloads.get("logprobs"),
-            seed=payloads.get("seed"),
+            **generation,
             response_modalities=modalities,
             tools=cast(types.ToolListUnion | None, tool_list),
             tool_config=tool_config,
@@ -559,9 +649,10 @@ class ProviderGoogleGenAI(Provider):
         prompt_tokens = usage_metadata.prompt_token_count or 0
         cached = usage_metadata.cached_content_token_count or 0
         return TokenUsage(
-            input_other=prompt_tokens - cached,
+            input_other=max(0, prompt_tokens - cached),
             input_cached=cached,
-            output=usage_metadata.candidates_token_count or 0,
+            output=(usage_metadata.candidates_token_count or 0)
+            + (getattr(usage_metadata, "thoughts_token_count", None) or 0),
         )
 
     @staticmethod
@@ -806,7 +897,7 @@ class ProviderGoogleGenAI(Provider):
             raise ValueError(
                 "Gemini request is empty or ends with a model turn; provide actual user input or tool results."
             )
-        temperature = payloads.get("temperature", 0.7)
+        temperature = None
 
         result: types.GenerateContentResponse | None = None
         while True:
@@ -1153,7 +1244,18 @@ class ProviderGoogleGenAI(Provider):
 
         model = model or self.get_model()
 
-        payloads = {"messages": context_query, "model": model}
+        allowed_keys = {
+            alias
+            for aliases in self.GENERATION_PARAMETERS.values()
+            for alias in aliases
+        }
+        payloads = {
+            "messages": context_query,
+            "model": model,
+            "generation_overrides": {
+                key: value for key, value in kwargs.items() if key in allowed_keys
+            },
+        }
         if func_tool and not func_tool.empty():
             payloads["tool_choice"] = tool_choice
 
@@ -1220,7 +1322,18 @@ class ProviderGoogleGenAI(Provider):
 
         model = model or self.get_model()
 
-        payloads = {"messages": context_query, "model": model}
+        allowed_keys = {
+            alias
+            for aliases in self.GENERATION_PARAMETERS.values()
+            for alias in aliases
+        }
+        payloads = {
+            "messages": context_query,
+            "model": model,
+            "generation_overrides": {
+                key: value for key, value in kwargs.items() if key in allowed_keys
+            },
+        }
         if func_tool and not func_tool.empty():
             payloads["tool_choice"] = tool_choice
 

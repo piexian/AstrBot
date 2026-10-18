@@ -4,6 +4,7 @@ import inspect
 import json
 import random
 import re
+import uuid
 from collections.abc import AsyncGenerator
 from typing import Any, Literal
 
@@ -16,7 +17,7 @@ from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from openai.types.completion_usage import CompletionUsage
 
 import astrbot.core.message.components as Comp
-from astrbot import logger
+from astrbot import __version__, logger
 from astrbot.api.provider import Provider
 from astrbot.core.agent.message import (
     AudioURLPart,
@@ -40,7 +41,10 @@ from astrbot.core.utils.network_utils import (
 )
 from astrbot.core.utils.string_utils import normalize_and_dedupe_strings
 
-from ..headers import build_conversation_headers
+from ..headers import (
+    RequestHeaderContext,
+    build_conversation_headers,
+)
 from ..register import register_provider_adapter
 from .request_retry import retry_provider_request
 
@@ -536,6 +540,7 @@ class ProviderOpenAIOfficial(Provider):
         *,
         request_max_retries: int | None = None,
         conversation_id: str | None = None,
+        request_headers: dict[str, str] | None = None,
     ) -> LLMResponse:
         if tools:
             model = payloads.get("model", "").lower()
@@ -573,7 +578,11 @@ class ProviderOpenAIOfficial(Provider):
                 **payloads,
                 stream=False,
                 extra_body=extra_body,
-                extra_headers=build_conversation_headers(conversation_id),
+                extra_headers=(
+                    request_headers
+                    if request_headers is not None
+                    else build_conversation_headers(conversation_id)
+                ),
             ),
             max_attempts=request_max_retries,
         )
@@ -596,6 +605,7 @@ class ProviderOpenAIOfficial(Provider):
         *,
         request_max_retries: int | None = None,
         conversation_id: str | None = None,
+        request_headers: dict[str, str] | None = None,
     ) -> AsyncGenerator[LLMResponse, None]:
         """流式查询API，逐步返回结果"""
         if tools:
@@ -633,7 +643,11 @@ class ProviderOpenAIOfficial(Provider):
                 **payloads,
                 stream=True,
                 extra_body=extra_body,
-                extra_headers=build_conversation_headers(conversation_id),
+                extra_headers=(
+                    request_headers
+                    if request_headers is not None
+                    else build_conversation_headers(conversation_id)
+                ),
                 stream_options={"include_usage": True},
             ),
             max_attempts=request_max_retries,
@@ -1206,6 +1220,8 @@ class ProviderOpenAIOfficial(Provider):
         **kwargs,
     ) -> LLMResponse:
         conversation_id = kwargs.pop("conversation_id", None)
+        umo = kwargs.pop("umo", None)
+        request_id = kwargs.pop("request_id", None) or uuid.uuid4().hex
         payloads, context_query = await self._prepare_chat_payload(
             prompt,
             image_urls,
@@ -1220,6 +1236,18 @@ class ProviderOpenAIOfficial(Provider):
         if func_tool and not func_tool.empty():
             payloads["tool_choice"] = tool_choice
 
+        request_headers = self.resolve_request_headers(
+            RequestHeaderContext(
+                conversation_id=conversation_id or "",
+                umo=umo or "",
+                request_id=request_id,
+                model=str(payloads.get("model", "")),
+                provider_id=str(self.provider_config.get("id", "")),
+                version=__version__,
+            )
+        )
+        request_headers.update(build_conversation_headers(conversation_id))
+
         llm_response = None
         max_retries = 10
         available_api_keys = self.api_keys.copy()
@@ -1231,7 +1259,7 @@ class ProviderOpenAIOfficial(Provider):
         for retry_cnt in range(max_retries):
             try:
                 self.client.api_key = chosen_key
-                query_kwargs = {}
+                query_kwargs = {"request_headers": request_headers}
                 if conversation_id:
                     query_kwargs["conversation_id"] = conversation_id
                 llm_response = await self._query(
@@ -1289,6 +1317,8 @@ class ProviderOpenAIOfficial(Provider):
     ) -> AsyncGenerator[LLMResponse, None]:
         """流式对话，与服务商交互并逐步返回结果"""
         conversation_id = kwargs.pop("conversation_id", None)
+        umo = kwargs.pop("umo", None)
+        request_id = kwargs.pop("request_id", None) or uuid.uuid4().hex
         payloads, context_query = await self._prepare_chat_payload(
             prompt,
             image_urls,
@@ -1302,6 +1332,18 @@ class ProviderOpenAIOfficial(Provider):
         if func_tool and not func_tool.empty():
             payloads["tool_choice"] = tool_choice
 
+        request_headers = self.resolve_request_headers(
+            RequestHeaderContext(
+                conversation_id=conversation_id or "",
+                umo=umo or "",
+                request_id=request_id,
+                model=str(payloads.get("model", "")),
+                provider_id=str(self.provider_config.get("id", "")),
+                version=__version__,
+            )
+        )
+        request_headers.update(build_conversation_headers(conversation_id))
+
         max_retries = 10
         available_api_keys = self.api_keys.copy()
         chosen_key = random.choice(available_api_keys)
@@ -1312,7 +1354,7 @@ class ProviderOpenAIOfficial(Provider):
         for retry_cnt in range(max_retries):
             try:
                 self.client.api_key = chosen_key
-                query_kwargs = {}
+                query_kwargs = {"request_headers": request_headers}
                 if conversation_id:
                     query_kwargs["conversation_id"] = conversation_id
                 async for response in self._query_stream(

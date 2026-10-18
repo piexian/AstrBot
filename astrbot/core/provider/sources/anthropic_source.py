@@ -1,6 +1,7 @@
 import base64
 import builtins
 import json
+import uuid
 from collections.abc import AsyncGenerator
 from typing import Any, Literal
 
@@ -11,7 +12,7 @@ from anthropic.types import Message
 from anthropic.types.message_delta_usage import MessageDeltaUsage
 from anthropic.types.usage import Usage
 
-from astrbot import logger
+from astrbot import __version__, logger
 from astrbot.api.provider import Provider
 from astrbot.core.agent.message import AudioURLPart, ContentPart, ImageURLPart, TextPart
 from astrbot.core.exceptions import EmptyModelOutputError
@@ -27,7 +28,10 @@ from astrbot.core.utils.network_utils import (
     log_connection_failure,
 )
 
-from ..headers import build_conversation_headers, build_provider_headers
+from ..headers import (
+    RequestHeaderContext,
+    build_conversation_headers,
+)
 from ..register import register_provider_adapter
 from .request_retry import retry_provider_request, retry_provider_request_context
 
@@ -56,32 +60,6 @@ class ProviderAnthropic(Provider):
             f"completion_id={completion_id}, stop_reason={stop_reason}"
         )
 
-    @staticmethod
-    def _normalize_custom_headers(provider_config: dict) -> dict[str, str] | None:
-        custom_headers = provider_config.get("custom_headers", {})
-        if not isinstance(custom_headers, dict) or not custom_headers:
-            return None
-        normalized_headers: dict[str, str] = {}
-        for key, value in custom_headers.items():
-            normalized_headers[str(key)] = str(value)
-        return normalized_headers or None
-
-    @classmethod
-    def _resolve_custom_headers(
-        cls,
-        provider_config: dict,
-        *,
-        required_headers: dict[str, str] | None = None,
-    ) -> dict[str, str] | None:
-        merged_headers = build_provider_headers(
-            cls._normalize_custom_headers(provider_config)
-        )
-        if required_headers:
-            for header_name, header_value in required_headers.items():
-                if not merged_headers.get(header_name, "").strip():
-                    merged_headers[header_name] = header_value
-        return merged_headers
-
     def __init__(
         self,
         provider_config,
@@ -101,7 +79,7 @@ class ProviderAnthropic(Provider):
         if isinstance(self.timeout, str):
             self.timeout = int(self.timeout)
         self.thinking_config = provider_config.get("anth_thinking_config", {})
-        self.custom_headers = self._resolve_custom_headers(provider_config)
+        self.custom_headers = self.request_headers
 
         if use_api_key:
             self._init_api_key(provider_config)
@@ -517,6 +495,7 @@ class ProviderAnthropic(Provider):
         *,
         request_max_retries: int | None = None,
         conversation_id: str | None = None,
+        request_headers: dict[str, str] | None = None,
     ) -> LLMResponse:
         if tools:
             if tool_list := tools.get_func_desc_anthropic_style():
@@ -558,7 +537,11 @@ class ProviderAnthropic(Provider):
                     **payloads,
                     stream=False,
                     extra_body=extra_body,
-                    extra_headers=build_conversation_headers(conversation_id),
+                    extra_headers=(
+                        request_headers
+                        if request_headers is not None
+                        else build_conversation_headers(conversation_id)
+                    ),
                 ),
                 max_attempts=request_max_retries,
             )
@@ -632,6 +615,7 @@ class ProviderAnthropic(Provider):
         *,
         request_max_retries: int | None = None,
         conversation_id: str | None = None,
+        request_headers: dict[str, str] | None = None,
     ) -> AsyncGenerator[LLMResponse, None]:
         if tools:
             if tool_list := tools.get_func_desc_anthropic_style():
@@ -675,7 +659,11 @@ class ProviderAnthropic(Provider):
             lambda: self.client.messages.stream(
                 **payloads,
                 extra_body=extra_body,
-                extra_headers=build_conversation_headers(conversation_id),
+                extra_headers=(
+                    request_headers
+                    if request_headers is not None
+                    else build_conversation_headers(conversation_id)
+                ),
             ),
             max_attempts=request_max_retries,
         ) as stream:
@@ -826,6 +814,8 @@ class ProviderAnthropic(Provider):
         **kwargs,
     ) -> LLMResponse:
         conversation_id = kwargs.pop("conversation_id", None)
+        umo = kwargs.pop("umo", None)
+        request_id = kwargs.pop("request_id", None) or uuid.uuid4().hex
         if contexts is None:
             contexts = []
         new_record = None
@@ -871,9 +861,21 @@ class ProviderAnthropic(Provider):
                 else system_prompt
             )
 
+        request_headers = self.resolve_request_headers(
+            RequestHeaderContext(
+                conversation_id=conversation_id or "",
+                umo=umo or "",
+                request_id=request_id,
+                model=str(payloads.get("model", "")),
+                provider_id=str(self.provider_config.get("id", "")),
+                version=__version__,
+            )
+        )
+        request_headers.update(build_conversation_headers(conversation_id))
+
         llm_response = None
         try:
-            query_kwargs = {}
+            query_kwargs = {"request_headers": request_headers}
             if conversation_id:
                 query_kwargs["conversation_id"] = conversation_id
             llm_response = await self._query(
@@ -904,6 +906,8 @@ class ProviderAnthropic(Provider):
         **kwargs,
     ):
         conversation_id = kwargs.pop("conversation_id", None)
+        umo = kwargs.pop("umo", None)
+        request_id = kwargs.pop("request_id", None) or uuid.uuid4().hex
         if contexts is None:
             contexts = []
         new_record = None
@@ -948,7 +952,19 @@ class ProviderAnthropic(Provider):
                 else system_prompt
             )
 
-        query_kwargs = {}
+        request_headers = self.resolve_request_headers(
+            RequestHeaderContext(
+                conversation_id=conversation_id or "",
+                umo=umo or "",
+                request_id=request_id,
+                model=str(payloads.get("model", "")),
+                provider_id=str(self.provider_config.get("id", "")),
+                version=__version__,
+            )
+        )
+        request_headers.update(build_conversation_headers(conversation_id))
+
+        query_kwargs = {"request_headers": request_headers}
         if conversation_id:
             query_kwargs["conversation_id"] = conversation_id
         async for llm_response in self._query_stream(

@@ -235,6 +235,9 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
         **kwargs: T.Any,
     ) -> None:
         self.req = request
+        # Stable per-run ID shared by every request of this run, including tool
+        # rounds, fallback providers and retries.
+        self._request_id = uuid.uuid4().hex
         self.streaming = streaming
         self.enforce_max_turns = enforce_max_turns
         self.llm_compress_instruction = llm_compress_instruction
@@ -511,6 +514,8 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
             "contexts": self._sanitize_contexts_for_provider(self.run_context.messages),
             "func_tool": self._func_tool_for_provider(),
             "session_id": self.req.session_id,
+            "umo": self.req.session_id,
+            "request_id": self._request_id,
             "conversation_id": (
                 self.req.conversation.cid if self.req.conversation else None
             ),
@@ -1505,6 +1510,11 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                         func_tool=param_subset,
                         model=self.req.model,
                         session_id=self.req.session_id,
+                        umo=self.req.session_id,
+                        request_id=self._request_id,
+                        conversation_id=(
+                            self.req.conversation.cid if self.req.conversation else None
+                        ),
                         extra_user_content_parts=self.req.extra_user_content_parts,
                         # tool_choice="required",
                         abort_signal=self._abort_signal,
@@ -1537,6 +1547,13 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
                             func_tool=param_subset,
                             model=self.req.model,
                             session_id=self.req.session_id,
+                            umo=self.req.session_id,
+                            request_id=self._request_id,
+                            conversation_id=(
+                                self.req.conversation.cid
+                                if self.req.conversation
+                                else None
+                            ),
                             extra_user_content_parts=self.req.extra_user_content_parts,
                             # tool_choice="required",
                             abort_signal=self._abort_signal,

@@ -133,6 +133,35 @@ async def test_provider_sdk_sends_exactly_one_user_agent(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("custom_headers", [{}, {"user-agent": "custom/1.0"}])
+async def test_gemini_text_chat_sends_exactly_one_user_agent(
+    custom_headers, provider_http_server
+):
+    # Per-request http_options make google-genai append its own lower-case UA
+    # next to ours; the transport-level hook must keep a single User-Agent.
+    base_url, requests = provider_http_server
+    config = {
+        "id": "test-provider",
+        "model": "test-model",
+        "key": ["test-key"],
+        "api_base": base_url,
+        "custom_headers": custom_headers,
+    }
+    provider = ProviderGoogleGenAI(config, {})
+    try:
+        # The stub server returns no candidates, so text_chat raises after
+        # the request itself has been captured.
+        with pytest.raises(Exception, match="candidates is empty"):
+            await provider.text_chat(prompt="hi", conversation_id="cid-1")
+        assert len(requests) == 1
+        assert requests[0].getall("User-Agent") == [
+            custom_headers.get("user-agent", DEFAULT_USER_AGENT)
+        ]
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "provider_cls",
     [

@@ -9,3 +9,31 @@ Open **Config**, select the profile to use, and go to **AI → Model**. Set **Ch
 See [Connecting Model Services](./start.md) for detailed steps.
 
 > Provider connection settings are stored in `provider_sources` in `data/cmd_config.json`; individual model configurations are stored in `provider`.
+
+## Custom request header variables
+
+Custom request headers in a provider configuration support variable templates that are rendered per request:
+
+| Variable | Meaning |
+| --- | --- |
+| `{conversation_id}` | AstrBot conversation ID, falling back to the request ID when empty |
+| `{umo}` | Unified message origin of the request |
+| `{request_id}` | Request ID that stays stable within one agent run |
+| `{model}` | Model used by this request |
+| `{provider_id}` | Provider configuration ID |
+| `{version}` | AstrBot version |
+
+`{sha256:<template>}` hashes the rendered inner template with SHA-256 and can be nested. A header is omitted when a referenced variable has no value. Literal braces must be doubled:
+
+```text
+{{ -> {
+}} -> }
+```
+
+```json
+{
+  "x-opencode-session": "{sha256:{conversation_id}}"
+}
+```
+
+`{umo}` may contain platform, group or user information and is sent to third-party services; SHA-256 is only an encoding, not anonymization. Existing values that contain literal braces must use the doubled form, otherwise saving or loading the provider reports an error.

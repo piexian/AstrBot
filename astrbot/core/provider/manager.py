@@ -14,6 +14,7 @@ from astrbot.core.utils.error_redaction import safe_error
 
 from ..persona_mgr import PersonaManager
 from .entities import ProviderType
+from .headers import validate_provider_headers
 from .provider import (
     EmbeddingProvider,
     Provider,
@@ -944,6 +945,8 @@ class ProviderManager:
                     and provider.get("id", None) != origin_provider_id
                 ):
                     raise ValueError(f"Provider ID {npid} already exists")
+            # Reject invalid header templates before touching the stored config.
+            validate_provider_headers(self.get_merged_provider_config(new_config))
             # update config
             for idx, provider in enumerate(config["provider"]):
                 if provider.get("id", None) == origin_provider_id:
@@ -965,6 +968,8 @@ class ProviderManager:
             for provider in config["provider"]:
                 if provider.get("id", None) == npid:
                     raise ValueError(f"Provider ID {npid} already exists")
+            # Reject invalid header templates before touching the stored config.
+            validate_provider_headers(self.get_merged_provider_config(new_config))
             # add to config
             config["provider"].append(new_config)
             config.save_config()

@@ -1612,7 +1612,7 @@
 
       "custom_headers": {
         "description": "カスタムリクエストヘッダー",
-        "hint": "ここで追加したキーと値のペアは、カスタム HTTP リクエストヘッダーとして OpenAI SDK の default_headers に統合されます。値は文字列である必要があります。"
+        "hint": "値では {conversation_id}、{umo}、{request_id}、{model}、{provider_id}、{version} の変数、{sha256:...} のダイジェスト、リテラル波括弧の {{ と }} を使用できます（例: x-session: {sha256:{conversation_id}}）。{umo} にはプラットフォーム・グループ・ユーザー情報が含まれる場合があり、第三者に送信されます。SHA-256 はエンコードであり、匿名化ではありません。"
       },
       "ollama_disable_thinking": {
         "description": "思考モードを無効化",

@@ -1532,7 +1532,7 @@
 
       "custom_headers": {
         "description": "自定义请求头",
-        "hint": "此处添加的键值对将被合并到 OpenAI SDK 的 default_headers 中，用于自定义 HTTP 请求头。值必须为字符串。"
+        "hint": "值支持 {conversation_id}、{umo}、{request_id}、{model}、{provider_id}、{version} 变量，{sha256:...} 计算摘要，{{ 与 }} 表示字面花括号；例如 x-session: {sha256:{conversation_id}}。{umo} 可能包含平台、群组或用户信息并会发送给第三方；SHA-256 仅为编码，不等于匿名化。"
       },
       "ollama_disable_thinking": {
         "description": "关闭思考模式",

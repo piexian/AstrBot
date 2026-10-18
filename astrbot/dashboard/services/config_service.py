@@ -27,6 +27,10 @@ from astrbot.core.config.i18n_utils import ConfigMetadataI18n
 from astrbot.core.core_lifecycle import AstrBotCoreLifecycle
 from astrbot.core.db import BaseDatabase
 from astrbot.core.platform.register import platform_cls_map, platform_registry
+from astrbot.core.provider.headers import (
+    validate_header_templates,
+    validate_provider_headers,
+)
 from astrbot.core.provider.register import provider_registry
 from astrbot.core.star.star import star_registry
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
@@ -1562,6 +1566,17 @@ class ProviderConfigService:
                     f"Provider source ID '{next_source_id}' exists already, please try another ID."
                 )
 
+        # Reject invalid templates before the source or its providers reload. Source
+        # values are only checked for syntax: model lives on the child providers.
+        validate_header_templates(
+            config.get("custom_headers"),
+            provider_id=next_source_id,
+        )
+        for provider in self.config.get("provider", []):
+            if provider.get("provider_source_id") == source_id:
+                merged_config = {**config, **provider}
+                merged_config["id"] = provider.get("id")
+                validate_provider_headers(merged_config)
         for idx, source in enumerate(sources):
             if source.get("id") == source_id:
                 old_source_id = source.get("id") or source_id

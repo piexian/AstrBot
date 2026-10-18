@@ -9,3 +9,31 @@
 详细步骤见 [接入模型服务](./start.md)。
 
 > 提供商连接配置保存在 `data/cmd_config.json` 的 `provider_sources` 字段，具体模型配置保存在 `provider` 字段。
+
+## 自定义请求头变量
+
+提供商配置中的「自定义请求头」支持变量模板，值在每次请求时渲染：
+
+| 变量 | 含义 |
+| --- | --- |
+| `{conversation_id}` | AstrBot 会话 ID，为空时回退到本次请求 ID |
+| `{umo}` | 消息来源标识（unified message origin） |
+| `{request_id}` | 一次 Agent 运行内稳定的请求 ID |
+| `{model}` | 本次请求最终使用的模型名 |
+| `{provider_id}` | 提供商配置 ID |
+| `{version}` | AstrBot 版本 |
+
+`{sha256:<模板>}` 对内层渲染结果计算 SHA-256 摘要，支持嵌套。引用的变量为空时，该请求头会被省略。字面花括号需要写成双写形式：
+
+```text
+{{ -> {
+}} -> }
+```
+
+```json
+{
+  "x-opencode-session": "{sha256:{conversation_id}}"
+}
+```
+
+`{umo}` 可能包含平台、群组或用户信息，并会随请求发送给第三方服务；SHA-256 只是编码，不等于匿名化。旧配置中已存在的字面花括号需改为双写形式，否则保存和加载时会报错。

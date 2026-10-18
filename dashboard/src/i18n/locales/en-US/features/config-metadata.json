@@ -1511,7 +1511,7 @@
 
       "custom_headers": {
         "description": "Custom request headers",
-        "hint": "Key/value pairs added here are merged into the OpenAI SDK default_headers for custom HTTP headers. Values must be strings."
+        "hint": "Values support {conversation_id}, {umo}, {request_id}, {model}, {provider_id} and {version} variables, {sha256:...} digests, and {{ / }} for literal braces; for example x-session: {sha256:{conversation_id}}. {umo} may contain platform, group or user information and is sent to third parties; SHA-256 is only an encoding, not anonymization."
       },
       "ollama_disable_thinking": {
         "description": "Disable thinking mode",

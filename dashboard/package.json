@@ -31,7 +31,7 @@
     "highlight.js": "11.11.1",
     "katex": "^0.16.27",
     "lodash": "4.17.23",
-    "markdown-it": "^14.1.1",
+    "markdown-it": "^14.3.3",
     "markstream-vue": "1.0.5-beta.0",
     "mermaid": "^11.12.2",
     "monaco-editor": "^0.52.2",

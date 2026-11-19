@@ -1604,6 +1604,14 @@
         "description": "ネイティブ検索を有効化",
         "hint": "有効にすると、xAI の Chat Completions ネイティブ Live Search を使用してウェブ検索を行います（従量課金）。xAI プロバイダーにのみ適用されます。"
       },
+      "deepseek_web_search": {
+        "description": "DeepSeek サーバーサイド Web ツールを有効化",
+        "hint": "サーバーサイドの Web 検索・画像検索・深思考検索とリンク読み取りツールを注入します。deepseek-flash モデルの使用を推奨。[ドキュメント](https://api-docs.deepseek.com/guides/web_tools/)を参照。"
+      },
+      "deepseek_thinking": {
+        "description": "思考モードを有効化",
+        "hint": "リクエストに thinking パラメータを追加して思考モードを有効にします。Web ツールと併用すると深思考検索になります。"
+      },
       "rerank_api_base": {
         "description": "リランキングモデル API Base URL",
         "hint": "最終的なリクエスト URL は、Base URL とパスサフィックスを結合して生成されます（デフォルトは `/v1/rerank`）。"

@@ -1520,6 +1520,14 @@
         "description": "启用原生搜索功能",
         "hint": "启用后，将通过 xAI 的 Chat Completions 原生 Live Search 进行联网检索（按需计费）。仅对 xAI 提供商生效。"
       },
+      "deepseek_web_search": {
+        "description": "启用 DeepSeek 服务端联网工具",
+        "hint": "启用后注入服务端联网搜索与阅读链接工具，建议使用 deepseek-flash 模型，见[联网工具](https://api-docs.deepseek.com/guides/web_tools/)。"
+      },
+      "deepseek_thinking": {
+        "description": "启用思考模式",
+        "hint": "启用后请求体加入 thinking 参数开启思考模式，与联网工具同开即为深度思考搜索。"
+      },
       "rerank_api_base": {
         "description": "重排序模型 API Base URL",
         "hint": "最终请求路径由 Base URL 和路径后缀拼接而成（默认为 /v1/rerank）。"

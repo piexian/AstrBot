@@ -2258,6 +2258,24 @@ CONFIG_METADATA_2 = {
                             "type": "xai_chat_completion",
                         },
                     },
+                    "deepseek_web_search": {
+                        "description": "启用 DeepSeek 服务端联网工具",
+                        "type": "bool",
+                        "hint": "启用后注入服务端联网搜索与阅读链接工具，建议使用 deepseek-flash 模型，见[联网工具](https://api-docs.deepseek.com/guides/web_tools/)。",
+                        "condition": {
+                            "provider": "deepseek",
+                            "type": "openai_chat_completion",
+                        },
+                    },
+                    "deepseek_thinking": {
+                        "description": "启用思考模式",
+                        "type": "bool",
+                        "hint": "启用后请求体加入 thinking 参数开启思考模式，与联网工具同开即为深度思考搜索。",
+                        "condition": {
+                            "provider": "deepseek",
+                            "type": "openai_chat_completion",
+                        },
+                    },
                     "rerank_api_base": {
                         "description": "重排序模型 API Base URL",
                         "type": "string",

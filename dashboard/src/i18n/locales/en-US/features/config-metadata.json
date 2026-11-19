@@ -1499,6 +1499,14 @@
         "description": "Enable native search",
         "hint": "When enabled, uses xAI Chat Completions native Live Search for web queries (billed on demand). Only applies to xAI providers."
       },
+      "deepseek_web_search": {
+        "description": "Enable DeepSeek server-side web tools",
+        "hint": "Injects server-side web/image/deep-thinking search and link-reading tools; use the deepseek-flash model. See [web tools](https://api-docs.deepseek.com/guides/web_tools/)."
+      },
+      "deepseek_thinking": {
+        "description": "Enable thinking mode",
+        "hint": "Adds the thinking parameter to the request body; combined with the web tools it enables deep-thinking search."
+      },
       "rerank_api_base": {
         "description": "Rerank Model API Base URL",
         "hint": "The full request URL is formed by combining the Base URL and a path suffix (defaults to /v1/rerank)."

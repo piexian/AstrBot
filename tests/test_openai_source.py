@@ -13,6 +13,7 @@ from PIL import Image as PILImage
 
 import astrbot.core.provider.sources.openai_source as openai_source_module
 import astrbot.core.provider.sources.request_retry as request_retry
+from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot.core.exceptions import EmptyModelOutputError
 from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.provider.sources.groq_source import ProviderGroq
@@ -45,6 +46,92 @@ def _make_provider(overrides: dict | None = None) -> ProviderOpenAIOfficial:
         provider_config=provider_config,
         provider_settings={},
     )
+
+
+def _capture_create(monkeypatch, provider) -> dict:
+    """Patch ``create`` to capture kwargs and return a minimal completion."""
+    captured_kwargs = {}
+
+    async def fake_create(**kwargs):
+        captured_kwargs.update(kwargs)
+        return ChatCompletion.model_validate(
+            {
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-4o-mini",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+        )
+
+    monkeypatch.setattr(provider.client.chat.completions, "create", fake_create)
+    return captured_kwargs
+
+
+def _capture_stream_create(monkeypatch, provider) -> dict:
+    """Patch ``create`` to capture kwargs and return a minimal chunk stream."""
+    captured_kwargs = {}
+
+    async def fake_stream():
+        for chunk_payload in (
+            {
+                "id": "chatcmpl-stream",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "gpt-4o-mini",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": "ok"},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl-stream",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "gpt-4o-mini",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl-stream",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "gpt-4o-mini",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+        ):
+            yield ChatCompletionChunk.model_validate(chunk_payload)
+
+    async def fake_create(**kwargs):
+        captured_kwargs.update(kwargs)
+        return fake_stream()
+
+    monkeypatch.setattr(provider.client.chat.completions, "create", fake_create)
+    return captured_kwargs
 
 
 def _make_groq_provider(overrides: dict | None = None) -> ProviderGroq:
@@ -424,6 +511,29 @@ async def test_openai_payload_keeps_reasoning_content_in_assistant_history():
             {"type": "text", "text": "final answer"}
         ]
         assert assistant_message["reasoning_content"] == "step 1"
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_relay_deepseek_flash_backfills_empty_reasoning_content():
+    provider = _make_provider({"api_base": "https://relay.example.com/v1"})
+    try:
+        payloads = {
+            "model": "deepseek-flash",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "follow up"},
+            ],
+        }
+
+        provider._finally_convert_payload(payloads)
+
+        # The relay host is not api.deepseek.com, so only the model-name
+        # marker can trigger the required empty reasoning_content backfill.
+        assistant_message = payloads["messages"][1]
+        assert assistant_message["reasoning_content"] == ""
     finally:
         await provider.terminate()
 
@@ -1481,6 +1591,352 @@ async def test_query_injects_reasoning_effort_none_for_ollama(monkeypatch):
         assert extra_body["reasoning_effort"] == "none"
         assert "reasoning" not in extra_body
         assert extra_body["temperature"] == 0.1
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_query_merges_custom_server_tools_with_registered_tools(monkeypatch):
+    provider = _make_provider(
+        {
+            "custom_extra_body": {
+                "tools": [
+                    {"type": "web_search", "search_mode": "perform_first_search"}
+                ],
+                "custom_flag": True,
+            }
+        }
+    )
+    try:
+        captured_kwargs = _capture_create(monkeypatch, provider)
+
+        tool_set = ToolSet(
+            [
+                FunctionTool(
+                    name="get_time",
+                    description="Get the current time.",
+                    parameters={"type": "object", "properties": {}},
+                )
+            ]
+        )
+
+        await provider._query(
+            payloads={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            tools=tool_set,
+        )
+
+        # Server-side tools from the custom body must coexist with the
+        # registered function tools instead of replacing them.
+        assert [tool["type"] for tool in captured_kwargs["tools"]] == [
+            "function",
+            "web_search",
+        ]
+        assert captured_kwargs["tools"][0]["function"]["name"] == "get_time"
+        assert "tools" not in captured_kwargs["extra_body"]
+        assert captured_kwargs["extra_body"]["custom_flag"] is True
+        assert provider.provider_config["custom_extra_body"]["tools"] == [
+            {"type": "web_search", "search_mode": "perform_first_search"}
+        ]
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_query_custom_tool_overrides_registered_tool_with_same_name(monkeypatch):
+    provider = _make_provider(
+        {
+            "custom_extra_body": {
+                "tools": [{"type": "web_search", "name": "web_search", "max_uses": 3}]
+            }
+        }
+    )
+    try:
+        captured_kwargs = _capture_create(monkeypatch, provider)
+
+        tool_set = ToolSet(
+            [
+                FunctionTool(
+                    name="web_search",
+                    description="Client-side web search.",
+                    parameters={"type": "object", "properties": {}},
+                )
+            ]
+        )
+
+        await provider._query(
+            payloads={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            tools=tool_set,
+        )
+
+        # The custom tool's flat name collides with the registered tool's
+        # nested function name; the custom entry wins without duplicating.
+        assert captured_kwargs["tools"] == [
+            {"type": "web_search", "name": "web_search", "max_uses": 3}
+        ]
+        assert "tools" not in captured_kwargs["extra_body"]
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_query_custom_tools_without_registered_tools_pass_through(monkeypatch):
+    provider = _make_provider(
+        {
+            "custom_extra_body": {"tools": [{"type": "web_search"}]},
+        }
+    )
+    try:
+        captured_kwargs = _capture_create(monkeypatch, provider)
+
+        await provider._query(
+            payloads={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            tools=None,
+        )
+
+        # No registered tools: the custom body keeps its previous override
+        # semantics and goes out via extra_body untouched.
+        assert "tools" not in captured_kwargs
+        assert captured_kwargs["extra_body"]["tools"] == [{"type": "web_search"}]
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_query_stream_merges_custom_server_tools_with_registered_tools(
+    monkeypatch,
+):
+    provider = _make_provider(
+        {
+            "custom_extra_body": {
+                "tools": [
+                    {"type": "web_search", "search_mode": "perform_first_search"}
+                ],
+                "custom_flag": True,
+            }
+        }
+    )
+    try:
+        captured_kwargs = _capture_stream_create(monkeypatch, provider)
+
+        tool_set = ToolSet(
+            [
+                FunctionTool(
+                    name="get_time",
+                    description="Get the current time.",
+                    parameters={"type": "object", "properties": {}},
+                )
+            ]
+        )
+
+        async for _ in provider._query_stream(
+            payloads={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            tools=tool_set,
+        ):
+            pass
+
+        assert [tool["type"] for tool in captured_kwargs["tools"]] == [
+            "function",
+            "web_search",
+        ]
+        assert "tools" not in captured_kwargs["extra_body"]
+        assert captured_kwargs["extra_body"]["custom_flag"] is True
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_deepseek_flags_off_leave_request_untouched(monkeypatch):
+    provider = _make_provider(
+        {
+            "deepseek_web_search": False,
+            "deepseek_thinking": False,
+            "custom_extra_body": {"custom_flag": True},
+        }
+    )
+    try:
+        captured_kwargs = _capture_create(monkeypatch, provider)
+
+        await provider._query(
+            payloads={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            tools=None,
+        )
+
+        assert "tools" not in captured_kwargs
+        assert "thinking" not in captured_kwargs["extra_body"]
+        assert captured_kwargs["extra_body"]["custom_flag"] is True
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_deepseek_web_search_appends_server_tools_after_function_tools(
+    monkeypatch,
+):
+    provider = _make_provider({"deepseek_web_search": True})
+    try:
+        captured_kwargs = _capture_create(monkeypatch, provider)
+
+        tool_set = ToolSet(
+            [
+                FunctionTool(
+                    name="get_time",
+                    description="Get the current time.",
+                    parameters={"type": "object", "properties": {}},
+                )
+            ]
+        )
+
+        await provider._query(
+            payloads={
+                "model": "deepseek-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            tools=tool_set,
+        )
+
+        assert [tool["type"] for tool in captured_kwargs["tools"]] == [
+            "function",
+            "deepseek_web_search",
+            "deepseek_read_url",
+        ]
+        assert captured_kwargs["tools"][0]["function"]["name"] == "get_time"
+        assert "tools" not in captured_kwargs["extra_body"]
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_deepseek_web_search_creates_tools_without_function_tools(monkeypatch):
+    provider = _make_provider({"deepseek_web_search": True})
+    try:
+        captured_kwargs = _capture_create(monkeypatch, provider)
+
+        await provider._query(
+            payloads={
+                "model": "deepseek-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            tools=None,
+        )
+
+        assert captured_kwargs["tools"] == [
+            {"type": "deepseek_web_search"},
+            {"type": "deepseek_read_url"},
+        ]
+        assert "tools" not in captured_kwargs["extra_body"]
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_deepseek_thinking_flag_injects_and_custom_extra_body_wins(monkeypatch):
+    providers = [
+        _make_provider({"deepseek_thinking": True}),
+        _make_provider(
+            {
+                "deepseek_thinking": True,
+                "custom_extra_body": {"thinking": {"type": "disabled"}},
+            }
+        ),
+    ]
+    try:
+        results = []
+        for provider in providers:
+            captured_kwargs = _capture_create(monkeypatch, provider)
+
+            await provider._query(
+                payloads={
+                    "model": "deepseek-flash",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+                tools=None,
+            )
+            results.append(captured_kwargs["extra_body"].get("thinking"))
+
+        assert results[0] == {"type": "enabled"}
+        assert results[1] == {"type": "disabled"}
+    finally:
+        for provider in providers:
+            await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_deepseek_web_search_skips_types_declared_in_custom_extra_body(
+    monkeypatch,
+):
+    provider = _make_provider(
+        {
+            "deepseek_web_search": True,
+            "custom_extra_body": {
+                "tools": [{"type": "deepseek_web_search", "search_mode": "aggressive"}]
+            },
+        }
+    )
+    try:
+        captured_kwargs = _capture_create(monkeypatch, provider)
+
+        await provider._query(
+            payloads={
+                "model": "deepseek-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            tools=None,
+        )
+
+        # The custom declaration wins for its type; only the undeclared
+        # server tool gets injected.
+        assert captured_kwargs["tools"] == [
+            {"type": "deepseek_read_url"},
+            {"type": "deepseek_web_search", "search_mode": "aggressive"},
+        ]
+        assert "tools" not in captured_kwargs["extra_body"]
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["standard", "stream"])
+@pytest.mark.asyncio
+async def test_deepseek_web_search_and_thinking_combined(monkeypatch, streaming):
+    provider = _make_provider(
+        {
+            "deepseek_web_search": True,
+            "deepseek_thinking": True,
+        }
+    )
+    try:
+        payloads = {
+            "model": "deepseek-flash",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        if streaming:
+            captured_kwargs = _capture_stream_create(monkeypatch, provider)
+            async for _ in provider._query_stream(payloads=payloads, tools=None):
+                pass
+        else:
+            captured_kwargs = _capture_create(monkeypatch, provider)
+            await provider._query(payloads=payloads, tools=None)
+
+        assert captured_kwargs["tools"] == [
+            {"type": "deepseek_web_search"},
+            {"type": "deepseek_read_url"},
+        ]
+        assert captured_kwargs["extra_body"]["thinking"] == {"type": "enabled"}
     finally:
         await provider.terminate()
 

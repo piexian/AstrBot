@@ -435,6 +435,27 @@ class ProviderOpenAIOfficial(Provider):
         extra_body.pop("think", None)
         extra_body["reasoning_effort"] = "none"
 
+    def _maybe_inject_deepseek_web_tools(
+        self, payloads: dict, extra_body: dict
+    ) -> None:
+        """Inject DeepSeek server-side web tools and thinking when the flags are on."""
+        if bool(self.provider_config.get("deepseek_web_search", False)):
+            declared_types = set()
+            custom_tools = extra_body.get("tools")
+            if isinstance(custom_tools, list):
+                declared_types = {
+                    tool.get("type") for tool in custom_tools if isinstance(tool, dict)
+                }
+            server_tools = [
+                {"type": tool_type}
+                for tool_type in ("deepseek_web_search", "deepseek_read_url")
+                if tool_type not in declared_types
+            ]
+            if server_tools:
+                payloads["tools"] = [*payloads.get("tools", []), *server_tools]
+        if bool(self.provider_config.get("deepseek_thinking", False)):
+            extra_body.setdefault("thinking", {"type": "enabled"})
+
     async def get_models(self):
         try:
             models_str = []
@@ -561,6 +582,22 @@ class ProviderOpenAIOfficial(Provider):
         custom_extra_body = self.provider_config.get("custom_extra_body", {})
         if isinstance(custom_extra_body, dict):
             extra_body.update(custom_extra_body)
+        self._maybe_inject_deepseek_web_tools(payloads, extra_body)
+        # Custom server-side tools merge with registered function tools instead of overriding them.
+        custom_tools = extra_body.get("tools")
+        if isinstance(custom_tools, list) and isinstance(payloads.get("tools"), list):
+            merged = {}
+            for tool in [*payloads["tools"], *custom_tools]:
+                key = None
+                if isinstance(tool, dict):
+                    function = tool.get("function")
+                    key = tool.get("name") or (
+                        function.get("name") if isinstance(function, dict) else None
+                    )
+                merged[key if key else ("_", id(tool))] = tool
+            payloads["tools"] = list(merged.values())
+            extra_body = {k: v for k, v in extra_body.items() if k != "tools"}
+
         self._apply_provider_specific_request_overrides(payloads, extra_body)
 
         model = payloads.get("model", "").lower()
@@ -615,6 +652,21 @@ class ProviderOpenAIOfficial(Provider):
         custom_extra_body = self.provider_config.get("custom_extra_body", {})
         if isinstance(custom_extra_body, dict):
             extra_body.update(custom_extra_body)
+        self._maybe_inject_deepseek_web_tools(payloads, extra_body)
+        # See _query: custom server-side tools merge with registered function tools.
+        custom_tools = extra_body.get("tools")
+        if isinstance(custom_tools, list) and isinstance(payloads.get("tools"), list):
+            merged = {}
+            for tool in [*payloads["tools"], *custom_tools]:
+                key = None
+                if isinstance(tool, dict):
+                    function = tool.get("function")
+                    key = tool.get("name") or (
+                        function.get("name") if isinstance(function, dict) else None
+                    )
+                merged[key if key else ("_", id(tool))] = tool
+            payloads["tools"] = list(merged.values())
+            extra_body = {k: v for k, v in extra_body.items() if k != "tools"}
 
         to_del = []
         for key in payloads:
@@ -1009,12 +1061,17 @@ class ProviderOpenAIOfficial(Provider):
         """Finally convert the payload. Such as think part conversion, tool inject."""
         model = payloads.get("model", "").lower()
         is_gemini = "gemini" in model
-        _deepseek_v4_markers = ("deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4")
+        _deepseek_v4_markers = (
+            "deepseek-flash",
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+            "deepseek-v4",
+        )
         is_deepseek_v4_reasoning = (
             any(marker in model for marker in _deepseek_v4_markers)
             or "api.deepseek.com" in self.client.base_url.host
         )
-        # deepseek-chat and deepseek-reasoner now point to V4 models (per official website)
+        # deepseek-flash is the current name; legacy names remain callable and are served by V4.1 Flash
 
         # MiMo 推理模型（MiMo-V2.5-Pro / MiMo-V2.5 / MiMo-V2-Pro / MiMo-V2-Omni / MiMo-V2-Flash）
         # 要求 assistant 历史消息必须回传 reasoning_content，否则返回 400
